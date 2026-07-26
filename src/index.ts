@@ -42,7 +42,7 @@ export default {
   manifest: {
     id: '@aymwoo/plugin-lab-seat',
     name: '机房座位管理',
-    version: '0.1.1',
+    version: '0.1.2',
     description: '统一机房座位管理 - 教师编排布局分配座位，学生查看座位并签到',
     author: 'aymwoo',
     engines: { openlearn: '>= 0.1.0' },
@@ -88,69 +88,69 @@ export default {
     // 解析 raw better-sqlite3 实例用于 JOIN 平台表
     const rawDb: any = await ctx.resolve(IDatabaseToken);
 
-    // ── 1. 数据库迁移 ─────────────────────────────────
-    await ctx.db.migrate(1, async (sqliteDb: any) => {
-      // 机房元信息
-      sqliteDb.exec(`
-        CREATE TABLE IF NOT EXISTS ${ctx.db.table('rooms')} (
-          id TEXT PRIMARY KEY,
-          name TEXT NOT NULL,
-          rows INTEGER NOT NULL,
-          cols INTEGER NOT NULL,
-          layout_json TEXT NOT NULL,
-          created_at INTEGER NOT NULL,
-          updated_at INTEGER NOT NULL
-        )
-      `);
-      // 座位分配
-      sqliteDb.exec(`
-        CREATE TABLE IF NOT EXISTS ${ctx.db.table('seat_assignments')} (
-          id TEXT PRIMARY KEY,
-          lesson_id TEXT NOT NULL,
-          student_id TEXT NOT NULL,
-          lab_id TEXT NOT NULL,
-          row_idx INTEGER NOT NULL,
-          col_idx INTEGER NOT NULL,
-          group_id TEXT DEFAULT '',
-          assigned_strategy TEXT DEFAULT 'manual',
-          assigned_at INTEGER NOT NULL,
-          UNIQUE(lesson_id, student_id)
-        )
-      `);
-      // 签到记录
-      sqliteDb.exec(`
-        CREATE TABLE IF NOT EXISTS ${ctx.db.table('attendance_records')} (
-          id TEXT PRIMARY KEY,
-          lesson_id TEXT NOT NULL,
-          student_id TEXT NOT NULL,
-          status TEXT NOT NULL DEFAULT 'absent',
-          checked_in_at INTEGER,
-          note TEXT DEFAULT '',
-          UNIQUE(lesson_id, student_id)
-        )
-      `);
-      // 签到会话
-      sqliteDb.exec(`
-        CREATE TABLE IF NOT EXISTS ${ctx.db.table('check_in_sessions')} (
-          id TEXT PRIMARY KEY,
-          lesson_id TEXT NOT NULL,
-          lab_id TEXT,
-          status TEXT NOT NULL DEFAULT 'closed',
-          opened_at INTEGER,
-          closed_at INTEGER
-        )
-      `);
-      // 课节模板
-      sqliteDb.exec(`
-        CREATE TABLE IF NOT EXISTS ${ctx.db.table('seat_templates')} (
-          id TEXT PRIMARY KEY,
-          name TEXT NOT NULL,
-          lab_id TEXT NOT NULL,
-          assignments_json TEXT NOT NULL,
-          created_at INTEGER NOT NULL
-        )
-      `);
-    });
+   // ── 1. 数据库迁移 ─────────────────────────────────
+   await ctx.db.migrate(1, async (sqliteDb: any) => {
+     // 机房元信息
+     sqliteDb.prepare(`
+       CREATE TABLE IF NOT EXISTS ${ctx.db.table('rooms')} (
+         id TEXT PRIMARY KEY,
+         name TEXT NOT NULL,
+         rows INTEGER NOT NULL,
+         cols INTEGER NOT NULL,
+         layout_json TEXT NOT NULL,
+         created_at INTEGER NOT NULL,
+         updated_at INTEGER NOT NULL
+       )
+     `).run();
+     // 座位分配
+     sqliteDb.prepare(`
+       CREATE TABLE IF NOT EXISTS ${ctx.db.table('seat_assignments')} (
+         id TEXT PRIMARY KEY,
+         lesson_id TEXT NOT NULL,
+         student_id TEXT NOT NULL,
+         lab_id TEXT NOT NULL,
+         row_idx INTEGER NOT NULL,
+         col_idx INTEGER NOT NULL,
+         group_id TEXT DEFAULT '',
+         assigned_strategy TEXT DEFAULT 'manual',
+         assigned_at INTEGER NOT NULL,
+         UNIQUE(lesson_id, student_id)
+       )
+     `).run();
+     // 签到记录
+     sqliteDb.prepare(`
+       CREATE TABLE IF NOT EXISTS ${ctx.db.table('attendance_records')} (
+         id TEXT PRIMARY KEY,
+         lesson_id TEXT NOT NULL,
+         student_id TEXT NOT NULL,
+         status TEXT NOT NULL DEFAULT 'absent',
+         checked_in_at INTEGER,
+         note TEXT DEFAULT '',
+         UNIQUE(lesson_id, student_id)
+       )
+     `).run();
+     // 签到会话
+     sqliteDb.prepare(`
+       CREATE TABLE IF NOT EXISTS ${ctx.db.table('check_in_sessions')} (
+         id TEXT PRIMARY KEY,
+         lesson_id TEXT NOT NULL,
+         lab_id TEXT,
+         status TEXT NOT NULL DEFAULT 'closed',
+         opened_at INTEGER,
+         closed_at INTEGER
+       )
+     `).run();
+     // 课节模板
+     sqliteDb.prepare(`
+       CREATE TABLE IF NOT EXISTS ${ctx.db.table('seat_templates')} (
+         id TEXT PRIMARY KEY,
+         name TEXT NOT NULL,
+         lab_id TEXT NOT NULL,
+         assignments_json TEXT NOT NULL,
+         created_at INTEGER NOT NULL
+       )
+     `).run();
+   });
 
     // ── 表名引用 ──────────────────────────────────────
     const T_ROOMS = ctx.db.table('rooms');
@@ -317,10 +317,10 @@ export default {
           const tmpl = rawDb.prepare(`SELECT * FROM ${T_TEMPLATES} WHERE id = ?`).get(p.templateId);
           if (!tmpl) throw new Error('模板不存在');
           const assignments = JSON.parse(tmpl.assignments_json);
-          const delStmt = rawDb.prepare(`DELETE FROM ${T_ASSIGN} WHERE lesson_id = ? AND lab_id = ?`);
+          const delStmt = rawDb.prepare(`DELETE FROM ${T_ASSIGN} WHERE lesson_id = ? AND lab_id = ?`).run();
           const insStmt = rawDb.prepare(`INSERT OR REPLACE INTO ${T_ASSIGN}
             (id, lesson_id, student_id, lab_id, row_idx, col_idx, group_id, assigned_strategy, assigned_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run();
           const now = Date.now();
           delStmt.run(p.lessonId, p.labId);
           for (const a of assignments) {
@@ -365,10 +365,10 @@ export default {
           // sequential 保持原序
 
           // 写入分配
-          const delStmt = rawDb.prepare(`DELETE FROM ${T_ASSIGN} WHERE lesson_id = ? AND lab_id = ?`);
+          const delStmt = rawDb.prepare(`DELETE FROM ${T_ASSIGN} WHERE lesson_id = ? AND lab_id = ?`).run();
           const insStmt = rawDb.prepare(`INSERT OR REPLACE INTO ${T_ASSIGN}
             (id, lesson_id, student_id, lab_id, row_idx, col_idx, group_id, assigned_strategy, assigned_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run();
           const now = Date.now();
           delStmt.run(p.lessonId, p.labId);
           for (let i = 0; i < students.length && i < shuffled.length; i++) {

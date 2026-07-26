@@ -4,6 +4,11 @@ All notable changes to the **机房座位管理（Lab Seat Management）Plugin**
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.1.2] - 2026-07-26
+
+### Fixed
+- **Worker 环境数据库迁移崩溃**: 将 `ctx.db.migrate` 回调中的 `sqliteDb.exec()` 替换为 `sqliteDb.prepare().run()`。Worker runtime 的数据库代理层不提供 `exec()` 方法，仅暴露 `prepare/run/get/all`。
+
 ## [0.1.1] - 2026-07-26
 
 ### Fixed
