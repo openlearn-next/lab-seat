@@ -42,7 +42,7 @@ export default {
   manifest: {
     id: '@aymwoo/plugin-lab-seat',
     name: '机房座位管理',
-    version: '0.1.4',
+    version: '0.1.5',
     description: '统一机房座位管理 - 教师编排布局分配座位，学生查看座位并签到',
     author: 'aymwoo',
     engines: { openlearn: '>= 0.1.0' },
@@ -677,8 +677,9 @@ export default {
         ).get(p.lessonId);
         if (!assign) throw new Error('该课节未分配座位');
         // 重走随机分配
+        // 使用 manifest.id 前缀确保 Worker 环境下类型匹配
         return commandBus.execute({
-          type: 'lab_seat.assign_seats',
+          type: `${ctx.manifest.id}.lab_seat.assign_seats`,
           payload: { lessonId: p.lessonId, labId: (assign as any).lab_id, strategy: 'random' },
           actorId: command.actorId,
         } as any);

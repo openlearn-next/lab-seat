@@ -4,6 +4,10 @@ All notable changes to the **机房座位管理（Lab Seat Management）Plugin**
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.1.5] - 2026-07-26
+
+### Fixed
+- **Worker 内 commandBus.execute 缺少前缀**: `shuffle_seats` 处理器内部调用 `commandBus.execute({ type: "lab_seat.assign_seats" })` 时 type 未被 Worker 代理层自动添加 manifest.id 前缀，导致主线程 CommandBus 找不到处理器。改为显式使用 `${ctx.manifest.id}.lab_seat.assign_seats`。
 ## [0.1.4] - 2026-07-26
 
 ### Fixed
