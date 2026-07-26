@@ -42,7 +42,7 @@ export default {
   manifest: {
     id: '@aymwoo/plugin-lab-seat',
     name: '机房座位管理',
-    version: '0.1.2',
+    version: '0.1.3',
     description: '统一机房座位管理 - 教师编排布局分配座位，学生查看座位并签到',
     author: 'aymwoo',
     engines: { openlearn: '>= 0.1.0' },
@@ -728,7 +728,7 @@ export default {
 
     // ── 11. 积分集成（EventBus 订阅） ──
 
-    eventBus.on('lab_seat.student_checked_in', async (event: any) => {
+    eventBus.subscribe('lab_seat.student_checked_in', async (event: any) => {
       try {
         const config = ctx.config as any;
         const points = config.points_per_check_in || 5;

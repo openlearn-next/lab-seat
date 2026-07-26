@@ -4,6 +4,10 @@ All notable changes to the **机房座位管理（Lab Seat Management）Plugin**
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.1.3] - 2026-07-26
+
+### Fixed
+- **eventBus.on 不存在**: 将 `eventBus.on()` 替换为 `eventBus.subscribe()`。Worker runtime 的 EventBus 代理层暴露的是 `subscribe/unsubscribe`，非 `on/off`。
 ## [0.1.2] - 2026-07-26
 
 ### Fixed
