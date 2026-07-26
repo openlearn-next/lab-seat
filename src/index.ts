@@ -42,7 +42,7 @@ export default {
   manifest: {
     id: '@aymwoo/plugin-lab-seat',
     name: '机房座位管理',
-    version: '0.1.5',
+    version: '0.2.0',
     description: '统一机房座位管理 - 教师编排布局分配座位，学生查看座位并签到',
     author: 'aymwoo',
     engines: { openlearn: '>= 0.1.0' },
@@ -89,19 +89,14 @@ export default {
     const rawDb: any = await ctx.resolve(IDatabaseToken);
 
    // ── 1. 数据库迁移 ─────────────────────────────────
+   // 机房数据复用平台 computer_labs 表，补缺失列（幂等）
+   try { rawDb.prepare("ALTER TABLE computer_labs ADD COLUMN name TEXT DEFAULT ''").run(); } catch {}
+   try { rawDb.prepare("ALTER TABLE computer_labs ADD COLUMN layout_json TEXT DEFAULT '{}'").run(); } catch {}
+   try { rawDb.prepare('ALTER TABLE computer_labs ADD COLUMN updated_at INTEGER DEFAULT 0').run(); } catch {}
+   // 存量数据：将 room_number 填充到 name
+   rawDb.prepare("UPDATE computer_labs SET name = room_number WHERE name = ''").run();
+
    await ctx.db.migrate(1, async (sqliteDb: any) => {
-     // 机房元信息
-     sqliteDb.prepare(`
-       CREATE TABLE IF NOT EXISTS ${ctx.db.table('rooms')} (
-         id TEXT PRIMARY KEY,
-         name TEXT NOT NULL,
-         rows INTEGER NOT NULL,
-         cols INTEGER NOT NULL,
-         layout_json TEXT NOT NULL,
-         created_at INTEGER NOT NULL,
-         updated_at INTEGER NOT NULL
-       )
-     `).run();
      // 座位分配
      sqliteDb.prepare(`
        CREATE TABLE IF NOT EXISTS ${ctx.db.table('seat_assignments')} (
@@ -160,7 +155,7 @@ export default {
       return (ctx.manifest as any)?.configuration?.properties?.[key]?.default;
     };
 
-    const T_ROOMS = ctx.db.table('rooms');
+    const T_ROOMS = 'computer_labs'; // 复用平台机房表
     const T_ASSIGN = ctx.db.table('seat_assignments');
     const T_ATTEND = ctx.db.table('attendance_records');
     const T_SESSIONS = ctx.db.table('check_in_sessions');
@@ -200,14 +195,25 @@ export default {
     }
 
     function getLabLayout(labId: string): LabLayout | null {
-      const row = rawDb.prepare(`SELECT layout_json FROM ${T_ROOMS} WHERE id = ?`).get(labId);
+      const row = rawDb.prepare(`SELECT rows, cols, layout_json FROM ${T_ROOMS} WHERE id = ?`).get(labId) as any;
       if (!row) return null;
-      try { return JSON.parse(row.layout_json); } catch { return null; }
+      // layout_json 存在则解析；否则从 rows/cols 自动生成基本网格
+      if (row.layout_json && row.layout_json !== '{}') {
+        try { return JSON.parse(row.layout_json); } catch {}
+      }
+      const cells: SeatCell[] = [];
+      for (let r = 0; r < row.rows; r++) {
+        for (let c = 0; c < row.cols; c++) {
+          const label = `${String.fromCharCode(65 + r)}${c + 1}`;
+          cells.push({ row: r, col: c, label, type: 'desktop', ip: '', note: '' });
+        }
+      }
+      return { rows: row.rows, cols: row.cols, numbering: { scheme: 'alphanumeric', direction: 'row-first' }, cells };
     }
 
     function getStudentSeatForLesson(lessonId: string, studentId: string) {
       return rawDb.prepare(
-        `SELECT sa.*, cr.name as lab_name, cr.rows, cr.cols
+        `SELECT sa.*, COALESCE(cr.name, cr.room_number) as lab_name, cr.rows, cr.cols
          FROM ${T_ASSIGN} sa
          JOIN ${T_ROOMS} cr ON cr.id = sa.lab_id
          WHERE sa.lesson_id = ? AND sa.student_id = ?`
@@ -226,12 +232,13 @@ export default {
       inputSchema: {
         type: 'OBJECT',
         properties: {
+          room_number: { type: 'STRING', description: '机房编号，如 410' },
           name: { type: 'STRING', description: '机房名称，如 A101' },
           rows: { type: 'NUMBER', description: '行数' },
           cols: { type: 'NUMBER', description: '列数' },
           numberingScheme: { type: 'STRING', description: '编号规则：alphanumeric 或 numeric' },
         },
-        required: ['name', 'rows', 'cols'],
+        required: ['room_number', 'rows', 'cols'],
       },
     });
 
@@ -251,8 +258,8 @@ export default {
         }
         const layout: LabLayout = { rows: p.rows, cols: p.cols, numbering: { scheme, direction: 'row-first' }, cells };
         const now = Date.now();
-        rawDb.prepare(`INSERT INTO ${T_ROOMS} (id, name, rows, cols, layout_json, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?)`).run(id, p.name, p.rows, p.cols, JSON.stringify(layout), now, now);
+        rawDb.prepare(`INSERT INTO ${T_ROOMS} (id, room_number, name, rows, cols, layout_json, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(id, p.name, p.name, p.rows, p.cols, JSON.stringify(layout), now, now);
 
         await eventBus.publish({
           id: uid(), type: 'lab_seat.room_created', source: `plugin.${pluginId}`,

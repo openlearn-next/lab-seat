@@ -38,6 +38,7 @@ const STATUS_LABELS: Record<string, string> = {
 function RoomEditor({ onCreated }: { onCreated: () => void }) {
   const [rooms, setRooms] = useState<any[]>([]);
   const [showForm, setShowForm] = useState(false);
+  const [roomNumber, setRoomNumber] = useState('');
   const [name, setName] = useState('');
   const [rows, setRows] = useState(5);
   const [cols, setCols] = useState(8);
@@ -50,9 +51,9 @@ function RoomEditor({ onCreated }: { onCreated: () => void }) {
   useEffect(() => { load(); }, [load]);
 
   const handleCreate = async () => {
-    if (!name) return;
-    await invoke('lab_seat.create_room', { name, rows, cols });
-    setName(''); setShowForm(false);
+    if (!roomNumber) return;
+    await invoke('lab_seat.create_room', { room_number: roomNumber, name: name || roomNumber, rows, cols });
+    setRoomNumber(''); setName(''); setShowForm(false);
     load(); onCreated();
   };
 
@@ -68,8 +69,12 @@ function RoomEditor({ onCreated }: { onCreated: () => void }) {
       style: { background: '#f9fafb', padding: 16, borderRadius: 8, marginBottom: 16, display: 'flex', gap: 12, alignItems: 'flex-end', flexWrap: 'wrap' },
     },
       React.createElement('label', { style: { display: 'flex', flexDirection: 'column', gap: 4 } },
+        React.createElement('span', { style: { fontSize: 13, color: '#6b7280' } }, '编号'),
+        React.createElement('input', { value: roomNumber, onChange: (e: any) => setRoomNumber(e.target.value), placeholder: '如 410', style: { padding: '6px 8px', border: '1px solid #d1d5db', borderRadius: 4, width: 100 } }),
+      ),
+      React.createElement('label', { style: { display: 'flex', flexDirection: 'column', gap: 4 } },
         React.createElement('span', { style: { fontSize: 13, color: '#6b7280' } }, '名称'),
-        React.createElement('input', { value: name, onChange: (e: any) => setName(e.target.value), placeholder: '如 A101', style: { padding: '6px 8px', border: '1px solid #d1d5db', borderRadius: 4, width: 100 } }),
+        React.createElement('input', { value: name, onChange: (e: any) => setName(e.target.value), placeholder: '如 A101（可选）', style: { padding: '6px 8px', border: '1px solid #d1d5db', borderRadius: 4, width: 100 } }),
       ),
       React.createElement('label', { style: { display: 'flex', flexDirection: 'column', gap: 4 } },
         React.createElement('span', { style: { fontSize: 13, color: '#6b7280' } }, '行数'),
@@ -88,7 +93,7 @@ function RoomEditor({ onCreated }: { onCreated: () => void }) {
       rooms.map((r: any) => React.createElement('div', {
         key: r.id, style: { padding: '10px 14px', border: '1px solid #e5e7eb', borderRadius: 6, display: 'flex', justifyContent: 'space-between', alignItems: 'center' },
       },
-        React.createElement('span', null, r.name, ' ', React.createElement('span', { style: { color: '#9ca3af', fontSize: 13 } }, `${r.rows}×${r.cols}`)),
+        React.createElement('span', null, r.room_number, r.name && r.name !== r.room_number ? ' ' + r.name : '', ' ', React.createElement('span', { style: { color: '#9ca3af', fontSize: 13 } }, `${r.rows}×${r.cols}`)),
         React.createElement('span', { style: { fontSize: 12, color: '#9ca3af' } }, new Date(r.created_at).toLocaleDateString()),
       )),
       rooms.length === 0 ? React.createElement('p', { style: { color: '#9ca3af' } }, '暂无机房') : null,

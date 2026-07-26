@@ -4,6 +4,13 @@ All notable changes to the **机房座位管理（Lab Seat Management）Plugin**
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.0] - 2026-07-27
+
+### Changed
+- **机房表统一到平台 `computer_labs`**: 移除插件独立的 `rooms` 表。激活时自动给 `computer_labs` 补 `name`、`layout_json`、`updated_at` 列。存量 `room_number` 自动填充到 `name`。所有机房 CRUD 直接读写 `computer_labs`，与平台机房数据互通。
+- **`lab_seat.create_room` 入参新增 `room_number`**：新建机房需提供编号（如 `410`），`name` 为可选显示名。
+- **布局自动生成**：`computer_labs` 无 `layout_json` 时，自动从 `rows`/`cols` 生成默认字母编号网格。
+
 ## [0.1.5] - 2026-07-26
 
 ### Fixed
