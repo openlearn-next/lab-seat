@@ -4,6 +4,11 @@ All notable changes to the **机房座位管理（Lab Seat Management）Plugin**
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.1.1] - 2026-07-26
+
+### Fixed
+- **Engines 版本约束过紧**: 将 `engines.openlearn` 从 `^3.4.0` 修正为 `>= 0.1.0`，修复 PluginHost 拒绝加载插件的问题（host 当前版本为 0.1.x）。
+
 ## [0.1.0] - 2026-07-26
 
 ### Added
