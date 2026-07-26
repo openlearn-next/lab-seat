@@ -1,5 +1,9 @@
 # OpenLearnV2 插件开发完全指南
 
+> 📅 **最后更新**：2026-07-27
+>
+> 本文档描述 Worker Thread 隔离模式与 Inline 模式的 API 差异。若你的插件运行在 Worker 模式下，请务必阅读 [§8.1.1 Worker 与 Inline 模式 API 差异](#811-worker-与-inline-模式-api-差异-⚠️)。
+
 
 
 ## 1. 系统架构概述
@@ -169,6 +173,10 @@ interface PluginContext {
   // V2.5: 主应用共享模块引用（白名单控制）
   require(moduleName: string): any;
 }
+```
+
+> ⚠️ **Worker 模式限制**：以上接口为 Inline 模式的完整 API。在 Worker Thread 隔离模式下，`ctx.config`、`ctx.provide()` 不可用，`ctx.db.migrate()` 回调仅暴露 `prepare()`，`eventBus` 使用 `subscribe()/unsubscribe()` 而非 `on()/off()`。详见 [8.1.1 Worker 与 Inline 模式 API 差异](#811-worker-与-inline-模式-api-差异-⚠️)。
+
 ```
 
 ### 2.5 生命周期状态机
@@ -948,7 +956,7 @@ interface PluginDatabaseAPI {
 | `prepare().run()` | 全版本 | 执行单条 SQL |
 | `prepare().get()` | 全版本 | 查询单行 |
 | `prepare().all()` | 全版本 | 查询多行 |
-| `exec()` | >= 9.0.0 | 批量执行多条 SQL（**可能不可用**） |
+| `exec()` | >= 9.0.0 | 批量执行多条 SQL（**Worker 模式不可用**） |
 | `pragma()` | >= 4.0.0 | PRAGMA 语句 |
 | `transaction()` | 全版本 | 事务包装 |
 
@@ -1431,6 +1439,33 @@ Worker 模式的特点：
 - 10 秒激活超时
 - 崩溃后自动清理（dispose 强制回收）
 
+#### 8.1.1 Worker 与 Inline 模式 API 差异 ⚠️
+
+Worker 线程通过 IPC 代理访问宿主服务，**并非所有 `PluginContext` API 都可用**。开发时若目标运行模式为 Worker，必须遵守以下约束：
+
+| API | Inline 模式 | Worker 模式 | 说明 |
+|---|---|---|---|
+| `ctx.services.commandBus` | 完整 | `registerHandler` / `execute` | `execute` 调用不自动加命名空间前缀，见下方 |
+| `ctx.services.eventBus` | `on()` / `off()` | `subscribe()` / `unsubscribe()` | 方法名不同 |
+| `ctx.services.actionRegistry` | 完整 | `register()` | — |
+| `ctx.db.migrate(fn)` | `sqliteDb.exec()` 可用 | 仅 `prepare().run/get/all` | **无 `exec`、无 `transaction`** |
+| `ctx.db.table()` | 返回 manifest ID 前缀 | 返回 UUID 前缀 | 同一次激活内一致，但切换模式会导致表名变化 |
+| `ctx.resolve(IDatabaseToken)` | 完整 `better-sqlite3` | 仅 `prepare().run/get/all` | **无 `exec`、无 `transaction`** |
+| `ctx.config` | 可用 | ❌ 不可用 | 需通过 `ctx.manifest.configuration.properties` 读取默认值 |
+| `ctx.provide()` | 可用 | ❌ 不可用 | 需 `typeof` 守卫跳过 |
+| `ctx.log` | 可用 | 可用 | — |
+| `ctx.pluginId` | manifest ID | UUID | — |
+| `ctx.manifest` | 可用 | 可用 | — |
+
+> **关键规则**：Worker 中 `commandBus.execute()` **不会**自动给 `type` 加 `manifest.id` 前缀（`registerHandler` 会）。从 Worker 内部调用另一个自己的命令时，必须手动拼接完整 type：
+> ```typescript
+> // ❌ Worker 中此调用会失败——type 缺少前缀
+> commandBus.execute({ type: 'myplugin.do_work', payload: {} });
+> 
+> // ✅ 手动加 manifest.id 前缀
+> commandBus.execute({ type: `${ctx.manifest.id}.myplugin.do_work`, payload: {} });
+> ```
+
 **结构化错误类**（`packages/core/worker-runtime/errors.ts`）：
 - `WorkerActivateError` — 插件在 Worker 内激活失败
 - `WorkerTimeoutError` — RPC 调用或激活/停用超时
@@ -1499,20 +1534,23 @@ eventBus.subscribe('process.completed', (event) => {
 
 ```typescript
 // 首次激活时调用（idempotent）
+// ✅ 使用 prepare().run() 同时兼容 Inline 和 Worker 模式
 await ctx.db.migrate(1, async (sqliteDb) => {
-  sqliteDb.exec(`
+  sqliteDb.prepare(`
     CREATE TABLE IF NOT EXISTS my_table (
       id TEXT PRIMARY KEY,
       data TEXT
-    );
-  `);
+    )
+  `).run();
 });
 
 // 后续版本升级
 await ctx.db.migrate(2, async (sqliteDb) => {
-  sqliteDb.exec(`ALTER TABLE my_table ADD COLUMN extra TEXT DEFAULT ''`);
+  sqliteDb.prepare(`ALTER TABLE my_table ADD COLUMN extra TEXT DEFAULT ''`).run();
 });
 ```
+
+> ⚠️ **Worker 兼容提示**：Worker 模式下 `migrate` 回调接收的是受限数据库代理，仅支持 `prepare().run()` / `prepare().get()` / `prepare().all()`。**不要使用 `sqliteDb.exec()`**（仅 Inline 模式可用）。建议始终使用 `prepare().run()` 编写迁移脚本以确保两种模式兼容。
 
 ### 8.7 自定义服务注册（V3.2）
 
@@ -1670,6 +1708,15 @@ describe('my-plugin', () => {
 - [ ] 数据库操作只使用 `prepare().run()` / `.get()` / `.all()`，避免 `exec()`、`pragma()` 等新版本方法
 - [ ] 跨插件调用（如 VFS）在 `capabilitiesProposed` 中声明了对应权限
 - [ ] `activate()` 中所有可能出现异常的操作包裹了 `try/catch`
+
+### Worker 兼容性检查 ⚠️（目标运行模式为 Worker 时必查）
+
+- [ ] `ctx.db.migrate()` 回调中**未使用 `sqliteDb.exec()`**，全部改为 `sqliteDb.prepare().run()`
+- [ ] `ctx.resolve(IDatabaseToken)` 返回的实例上**未调用 `.exec()` 或 `.transaction()`**
+- [ ] 未直接访问 `ctx.config`——改用 `ctx.manifest.configuration.properties` 读取默认值
+- [ ] `ctx.provide()` 调用包裹了 `typeof (ctx as any).provide === 'function'` 守卫
+- [ ] `eventBus` 使用 `subscribe()/unsubscribe()`，而非 `on()/off()`
+- [ ] Worker 内部 `commandBus.execute()` 的 `type` **手动拼接了 `ctx.manifest.id` 前缀**
 
 ### 前端检查
 
