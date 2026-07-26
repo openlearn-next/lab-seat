@@ -4,6 +4,12 @@ All notable changes to the **机房座位管理（Lab Seat Management）Plugin**
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.1.4] - 2026-07-26
+
+### Fixed
+- **ctx.config 不存在**: Worker runtime 不提供 `ctx.config`（IConfigService），新增 `getConfigValue` helper 从 `ctx.manifest.configuration.properties` 读取默认值。
+- **ctx.provide 不存在**: Worker runtime 不提供 `ctx.provide`，添加类型守卫 `if (typeof ctx.provide === "function")` 确保仅在主进程注册服务。
+- **迟到判定逻辑修正**: 原代码误读 `points_per_check_in` 计算迟到阈值，改为正确使用 `late_threshold_minutes` 配置项。
 ## [0.1.3] - 2026-07-26
 
 ### Fixed

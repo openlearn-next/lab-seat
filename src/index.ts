@@ -42,7 +42,7 @@ export default {
   manifest: {
     id: '@aymwoo/plugin-lab-seat',
     name: '机房座位管理',
-    version: '0.1.3',
+    version: '0.1.4',
     description: '统一机房座位管理 - 教师编排布局分配座位，学生查看座位并签到',
     author: 'aymwoo',
     engines: { openlearn: '>= 0.1.0' },
@@ -153,6 +153,13 @@ export default {
    });
 
     // ── 表名引用 ──────────────────────────────────────
+    // Worker runtime 不提供 ctx.config，fallback 到 manifest 默认值
+    const getConfigValue = (key: string): any => {
+      const cfg = (ctx as any).config;
+      if (cfg && typeof cfg[key] !== 'undefined') return cfg[key];
+      return (ctx.manifest as any)?.configuration?.properties?.[key]?.default;
+    };
+
     const T_ROOMS = ctx.db.table('rooms');
     const T_ASSIGN = ctx.db.table('seat_assignments');
     const T_ATTEND = ctx.db.table('attendance_records');
@@ -493,10 +500,9 @@ export default {
         }
 
         // 判断是否迟到
-        const config = ctx.config as any;
-        const lateThreshold = (config.points_per_check_in ? undefined : 10) * 60 * 1000;
+        const lateThresholdMs = (getConfigValue('late_threshold_minutes') ?? 10) * 60 * 1000;
         const openedAt = (session as any).opened_at;
-        const status: CheckInStatus = (openedAt && (now - openedAt) > lateThreshold) ? 'late' : 'checked_in';
+        const status: CheckInStatus = (openedAt && (now - openedAt) > lateThresholdMs) ? 'late' : 'checked_in';
 
         rawDb.prepare(`INSERT OR REPLACE INTO ${T_ATTEND}
           (id, lesson_id, student_id, status, checked_in_at, note)
@@ -730,8 +736,7 @@ export default {
 
     eventBus.subscribe('lab_seat.student_checked_in', async (event: any) => {
       try {
-        const config = ctx.config as any;
-        const points = config.points_per_check_in || 5;
+        const points = getConfigValue('points_per_check_in') ?? 5;
         if (points <= 0) return;
         // 尝试调用积分服务
         const pointsToken = { name: '@openlearn/core:IPointsLedgerService' };
@@ -750,7 +755,9 @@ export default {
 
     // ── 12. 注册 ILabSeatService 供其他插件消费 ──
 
-    await ctx.provide(
+    // Worker runtime 不支持 provide，仅主进程生效
+    if (typeof (ctx as any).provide === 'function') {
+      await (ctx as any).provide(
       { name: '@aymwoo/plugin-lab-seat:ILabSeatService' } as any,
       {
         async getStudentSeat(lessonId: string, studentId: string) {
@@ -774,7 +781,8 @@ export default {
           return s;
         },
       },
-    );
+      );
+    }
 
     ctx.log.info('Plugin activated');
   },
