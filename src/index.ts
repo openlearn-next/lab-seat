@@ -94,7 +94,7 @@ export default {
    try { rawDb.prepare("ALTER TABLE computer_labs ADD COLUMN layout_json TEXT DEFAULT '{}'").run(); } catch {}
    try { rawDb.prepare('ALTER TABLE computer_labs ADD COLUMN updated_at INTEGER DEFAULT 0').run(); } catch {}
    // 存量数据：将 room_number 填充到 name
-   rawDb.prepare("UPDATE computer_labs SET name = room_number WHERE name = ''").run();
+   rawDb.prepare("UPDATE computer_labs SET name = room_number WHERE name IS NULL OR name = ''").run();
 
    await ctx.db.migrate(1, async (sqliteDb: any) => {
      // 座位分配
@@ -283,7 +283,13 @@ export default {
     // 查询所有机房
     await commandBus.registerHandler('lab_seat.list_rooms', {
       async execute() {
-        return rawDb.prepare(`SELECT * FROM ${T_ROOMS} ORDER BY created_at DESC`).all();
+        // 兜底：name 缺失或为空时回退到 room_number，使前端用 display_name 永远拿到非空
+        return rawDb.prepare(`
+          SELECT id, room_number, name, rows, cols, layout_json, created_at, updated_at,
+                 COALESCE(NULLIF(name, ''), room_number) AS display_name
+          FROM ${T_ROOMS}
+          ORDER BY created_at DESC
+        `).all();
       },
     });
 

@@ -93,7 +93,7 @@ function RoomEditor({ onCreated }: { onCreated: () => void }) {
       rooms.map((r: any) => React.createElement('div', {
         key: r.id, style: { padding: '10px 14px', border: '1px solid #e5e7eb', borderRadius: 6, display: 'flex', justifyContent: 'space-between', alignItems: 'center' },
       },
-        React.createElement('span', null, r.room_number, r.name && r.name !== r.room_number ? ' ' + r.name : '', ' ', React.createElement('span', { style: { color: '#9ca3af', fontSize: 13 } }, `${r.rows}×${r.cols}`)),
+        React.createElement('span', null, r.display_name || r.room_number, ' ', React.createElement('span', { style: { color: '#9ca3af', fontSize: 13 } }, `${r.rows}×${r.cols}`)),
         React.createElement('span', { style: { fontSize: 12, color: '#9ca3af' } }, new Date(r.created_at).toLocaleDateString()),
       )),
       rooms.length === 0 ? React.createElement('p', { style: { color: '#9ca3af' } }, '暂无机房') : null,
@@ -180,7 +180,7 @@ function SeatAssignment() {
         React.createElement('span', { style: { fontSize: 13, color: '#6b7280' } }, '机房'),
         React.createElement('select', { value: selectedLab, onChange: (e: any) => setSelectedLab(e.target.value), style: { padding: '6px 8px', border: '1px solid #d1d5db', borderRadius: 4 } },
           React.createElement('option', { value: '' }, '-- 选择 --'),
-          rooms.map((r: any) => React.createElement('option', { key: r.id, value: r.id }, r.name)),
+          rooms.map((r: any) => React.createElement('option', { key: r.id, value: r.id }, r.display_name || r.name || r.room_number || r.id)),
         ),
       ),
       templates.length > 0 ? React.createElement('label', { style: { display: 'flex', flexDirection: 'column', gap: 4 } },
@@ -582,12 +582,23 @@ function LabSeatToolPanel() {
   const [visible, setVisible] = useState(false);
   const [summary, setSummary] = useState<any>(null);
   const [session, setSession] = useState<any>(null);
+  const [rooms, setRooms] = useState<any[]>([]);
+  const [selectedLabId, setSelectedLabId] = useState('');
 
   const load = async () => {
     const s = await invoke<any>('lab_seat.get_current_lesson_attendance');
     setSummary(s);
     const active = await invoke<any>('lab_seat.get_active_check_in', {});
     setSession(active);
+    const r = await invoke<any[]>('lab_seat.list_rooms');
+    const roomList = r || [];
+    setRooms(roomList);
+    // 优先级：active session 的 lab_id > 教师上次选过但仍存在的 > 第一条
+    setSelectedLabId(prev => {
+      if (active?.lab_id && roomList.some(rm => rm.id === active.lab_id)) return active.lab_id;
+      if (prev && roomList.some(rm => rm.id === prev)) return prev;
+      return roomList[0]?.id || '';
+    });
   };
 
   useEffect(() => {
@@ -617,6 +628,16 @@ function LabSeatToolPanel() {
       React.createElement('strong', null, '机房管理'),
       React.createElement('button', { onClick: toggle, style: { border: 'none', background: 'none', cursor: 'pointer', fontSize: 16 } }, '✕'),
     ),
+    React.createElement('label', { style: { display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 10 } },
+      React.createElement('span', { style: { fontSize: 12, color: '#6b7280' } }, '机房'),
+      rooms.length > 0 ? React.createElement('select', {
+        value: selectedLabId,
+        onChange: (e: any) => setSelectedLabId(e.target.value),
+        style: { padding: '6px 8px', border: '1px solid #d1d5db', borderRadius: 4, fontSize: 13 },
+      },
+        rooms.map((r: any) => React.createElement('option', { key: r.id, value: r.id }, r.display_name || r.name || r.room_number || r.id)),
+      ) : React.createElement('p', { style: { color: '#ef4444', fontSize: 12, margin: 0 } }, '尚无机房，请先在“机房管理”创建'),
+    ),
     session ? React.createElement('p', { style: { color: '#22c55e', marginBottom: 8 } }, '签到进行中') :
       React.createElement('p', { style: { color: '#9ca3af', marginBottom: 8 } }, '签到未开启'),
     summary ? React.createElement('div', { style: { display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap' } },
@@ -635,8 +656,13 @@ function LabSeatToolPanel() {
         style: { padding: '8px', border: '1px solid #d1d5db', borderRadius: 6, background: '#fff', cursor: 'pointer' },
       }, '📥 导出签到表'),
       React.createElement('button', {
-        onClick: async () => { await invoke('lab_seat.open_check_in', { lessonId: session?.lesson_id }); load(); },
-        style: { padding: '8px', border: '1px solid #22c55e', borderRadius: 6, background: '#f0fdf4', cursor: 'pointer' },
+        onClick: async () => {
+          if (!selectedLabId) { alert('请先选择机房'); return; }
+          await invoke('lab_seat.open_check_in', { lessonId: session?.lesson_id, labId: selectedLabId });
+          load();
+        },
+        disabled: !selectedLabId,
+        style: { padding: '8px', border: '1px solid #22c55e', borderRadius: 6, background: '#f0fdf4', cursor: !selectedLabId ? 'not-allowed' : 'pointer', opacity: !selectedLabId ? 0.5 : 1 },
       }, '▶️ 开始签到'),
       React.createElement('button', {
         onClick: async () => { await invoke('lab_seat.close_check_in', { lessonId: session?.lesson_id }); load(); },
