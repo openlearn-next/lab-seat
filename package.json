@@ -9,16 +9,20 @@
     "build": "openlearn-plugin-sdk build"
   },
   "dependencies": {
-    "@openlearn/plugin-sdk": "^3.4.0"
+    "@openlearn/plugin-sdk": "^3.4.3"
   },
   "peerDependencies": {
     "react": ">=17",
     "react-dom": ">=17"
   },
   "devDependencies": {
+    "@types/react": "^18.0.0",
     "esbuild": "^0.24.0",
+    "express": "^5.2.1",
     "jszip": "^3.10.0",
+    "pino": "^10.3.1",
+    "semver": "^7.8.5",
     "typescript": "^5.0.0",
-    "@types/react": "^18.0.0"
+    "uuid": "^14.0.1"
   }
 }
