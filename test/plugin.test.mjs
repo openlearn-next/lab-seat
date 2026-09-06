@@ -646,6 +646,43 @@ test('§2.5 unassign_student 移除单个学生座位', async () => {
   assert.equal(again.removed, false);
 });
 
+test('P1 错误 code：无分配学生签到被拒 / 非本课节学生防刷', async () => {
+  createHostSchema(db);
+  db.exec(`
+    INSERT INTO users (id, name, role) VALUES
+      ('s1', '张小明', 'student'), ('s-x', '外部学生', 'student');
+    INSERT INTO lessons (id, name, status) VALUES ('l-1', 'Test', 'live');
+    INSERT INTO classes (id) VALUES ('c-1');
+    INSERT INTO class_students (class_id, student_id) VALUES ('c-1', 's1');
+    INSERT INTO computer_labs (id, room_number, rows, cols) VALUES ('lab-A', 'A101', 2, 2);
+  `);
+  ctx = createMockContext(db);
+  mock = ctx.__test__;
+  await plugin.activate(ctx);
+
+  // 只有 s1 被分配到课节
+  await mock.commandHandlers.get('lab_seat.assign_seats').execute({
+    type: 'lab_seat.assign_seats', actorId: 't-1', payload: { lessonId: 'l-1', labId: 'lab-A', strategy: 'sequential' },
+  });
+  await mock.commandHandlers.get('lab_seat.open_check_in').execute({
+    type: 'lab_seat.open_check_in', actorId: 't-1', payload: { lessonId: 'l-1', labId: 'lab-A' },
+  });
+
+  const checkIn = mock.commandHandlers.get('lab_seat.check_in');
+
+  // s-x（未分配学生）签到 → NO_ASSIGNMENT，且消息带 [lab_seat:] 前缀
+  await assert.rejects(
+    () => checkIn.execute({ type: 'lab_seat.check_in', actorId: 's-x', payload: { lessonId: 'l-1' } }),
+    (e) => { assert.ok(e.code === 'NO_ASSIGNMENT', `code 应为 NO_ASSIGNMENT，实际 ${e.code}`); return true; },
+  );
+
+  // 已分配学生 s1 签到成功，重复签到返回幂等已签到（不抛）
+  const r1 = await checkIn.execute({ type: 'lab_seat.check_in', actorId: 's1', payload: { lessonId: 'l-1' } });
+  assert.ok(r1.status === 'checked_in' || r1.status === 'late');
+  const r2 = await checkIn.execute({ type: 'lab_seat.check_in', actorId: 's1', payload: { lessonId: 'l-1' } });
+  assert.equal(r2.message, '已签到', '重复签到返回幂等提示');
+});
+
 test('§3.3 attendance_trend 按课节返回到课率时间序列', async () => {
   createHostSchema(db);
   db.exec(`

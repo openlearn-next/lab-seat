@@ -4,6 +4,16 @@ All notable changes to the **机房座位管理（Lab Seat Management）Plugin**
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.6.1] - 2026-09-06
+
+### Added
+- **查询索引（P0 性能）**：为 `seat_assignments(lesson_id)` / `seat_assignments(lesson_id,lab_id)` / `attendance_records(lesson_id)` / `check_in_sessions(lesson_id,status)` / `seat_templates(lab_id)` / `lesson_room_map(lesson_id)` 建 `CREATE INDEX IF NOT EXISTS`（幂等）。高频 WHERE 不再线性扫表。
+- **统一错误规范（P1）**：新增 `LabSeatError` / `labError(code, msg)`，15 处 handler `throw` 全部迁移为带 `[lab_seat:CODE]` 前缀 + `err.code` 的错误（LESSON_NO_STUDENTS / ROOM_NOT_FOUND / SEATS_INSUFFICIENT / CHECKIN_NOT_OPEN / NO_ASSIGNMENT / AI_* 等）。前端 `humanizeErr()` 剥离前缀只显示可读中文。
+- **签到防刷（P1）**：学生自助签到前校验其在本课节 `seat_assignments` 中已分配，未分配学生（含外部 actorId 探测 lessonId）返回 `NO_ASSIGNMENT`，杜绝任意 ID 签到。重复签到仍走幂等「已签到」友好返回。
+
+### Fixed
+- 前端错误文案不再带 `[lab_seat:CODE]` 技术前缀（三处 catch 改为 humanizeErr）。
+
 ## [0.6.0] - 2026-09-06
 
 ### Added

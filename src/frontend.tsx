@@ -120,6 +120,12 @@ function downloadCsv(filename: string, csv: string): void {
   URL.revokeObjectURL(url);
 }
 
+// 剥离 [lab_seat:CODE] 前缀，只把可读中文展示给用户
+function humanizeErr(e: any): string {
+  if (!e?.message) return '操作失败';
+  return String(e.message).replace(/^\[lab_seat:[A-Z_]+\]\s*/, '');
+}
+
 // ── 常量 ──────────────────────────────────────────────
 
 const STATUS_COLORS: Record<string, string> = {
@@ -583,7 +589,7 @@ function SeatAssignment({ lessonId: externalLessonId }: { lessonId?: string } = 
       if (viewLabId) await loadAssignments();
       setDragMsg('');
     } catch (e: any) {
-      setDragMsg(e?.message || '分配失败');
+      setDragMsg(humanizeErr(e));
     }
   };
 
@@ -1261,7 +1267,7 @@ function StudentSeatView(props: { studentId?: string }) {
       const r = await invoke<any>('lab_seat.check_in', { lessonId: session.lesson_id });
       setMsg(`签到成功！(${STATUS_LABELS[r.status]})`);
       setAttendance(r);
-    } catch (e: any) { setMsg(e.message || '签到失败'); }
+    } catch (e: any) { setMsg(humanizeErr(e)); }
   };
 
   if (!studentId) return <div style={{ padding: 24, color: '#9ca3af' }}>请先登录学生账号</div>;

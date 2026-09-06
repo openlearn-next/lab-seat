@@ -1,7 +1,7 @@
 # Roadmap — openlearn-plugin-lab-seat
 
 > **Plugin**: `openlearn-plugin-lab-seat` (机房座位管理)
-> **Current version**: 0.6.0
+> **Current version**: 0.6.1
 > **Last audit**: 2026-09-06
 > **Target SDK**: `@openlearn/plugin-sdk@^3.5.2`
 
@@ -35,7 +35,7 @@
 
 ## 1. P0：必须先解决（阻塞性问题）
 
-### 1.1 SDK inline bug 导致服务端 bundle 体积膨胀
+### 1.1 SDK bundle 瘦身 ✅ 0.6.1 已落地（apply 宿主 commit 68ee958，bundle 7.4→0.2MB）
 
 **现状**：构建产物 `dist/index.js` 7.6 MB（仅服务端代码），远高于正常 plugin 的 100-300 KB。原因：`@openlearn/plugin-sdk@3.5.2` 的 `cli.mjs` 在 `onResolve` 钩子中把 `@openlearn/plugin-sdk` 解析为本地绝对路径，**优先级高于** `external: ['@openlearn/plugin-sdk']`，esbuild 把整个 SDK 源（含 PluginDistributionManager / ConfigService / Logger / EventBus 内部实现 + pino + uuid + express + jszip + semver）inline 进 plugin bundle。
 
@@ -62,7 +62,7 @@
 - 若 SDK 不提供，构建最小化集成测试 fixture：把 dist zip 解压到 mock host 目录，启动 mock CommandBus + EventBus，验证每个 command handler 在 worker 模式下不抛错
 - 覆盖边界场景：`computer_labs` 表不存在时的 ALTER TABLE 容错、`computer_labs` 表存在但无 `name`/`layout_json` 列时的迁移
 
-### 1.3 CSV 导出在中文 / 数字溢出场景下的健壮性
+### 1.3 CSV 导出健壮性 ✅ 0.3.0 已交付（RFC 4180 转义 + 14 测试）
 
 **现状**：CSV 使用 `\uFEFF` BOM 头保证 Excel 打开不乱码，但未做转义。学生姓名含逗号 / 引号 / 换行时导出文件格式会坏。
 
@@ -87,7 +87,7 @@
 - 一次性 write 操作风险高，可分两个 PR：先抽 `<SeatGrid>` 子组件（最重），再逐步迁移其他
 - **预期收益**：行数减少 30-40%、TypeScript 类型推导提升、可读性显著改善
 
-### 2.2 教师 Tab 内增加课节选择器（替代手填 lessonId）
+### 2.2 课节选择器 ✅ 0.3.0 已交付（LessonPicker + list_lessons）
 
 **现状**：4 个教师 Tab 都要求教师手动输入 `lessonId` UUID，体验差。教师通常不知道自己当前正在上的课的 lessonId。
 

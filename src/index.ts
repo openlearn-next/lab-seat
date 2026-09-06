@@ -56,6 +56,35 @@ interface ILabSeatService {
   getActivitySeatMap(activityId: string): Promise<Record<string, { labId: string; rowIdx: number; colIdx: number }>>;
 }
 
+// ── 统一错误（v0.6.x P1） ──
+// 所有 handler 抛错带 code 前缀，便于前端/AI/日志区分业务错误类型；
+// 中文 message 保持对最终用户可读。
+export type LabSeatErrorCode =
+  | 'LESSON_NO_STUDENTS'   // 课节无学生
+  | 'ROOM_NOT_FOUND'       // 机房不存在
+  | 'TEMPLATE_NOT_FOUND'   // 模板不存在
+  | 'SEATS_INSUFFICIENT'   // 可用座位不足
+  | 'NO_LAB_SELECTED'      // 未指定机房
+  | 'CHECKIN_NOT_OPEN'     // 签到未开启
+  | 'NO_ASSIGNMENT'        // 学生未分配座位
+  | 'LESSON_NO_ASSIGN'     // 课节尚未分配座位
+  | 'SMART_NO_INSTRUCTION' // 未提供排座要求
+  | 'AI_UNAVAILABLE'       // AI 服务不可用
+  | 'AI_CALL_FAILED';      // AI 调用失败
+
+export class LabSeatError extends Error {
+  code: LabSeatErrorCode;
+  constructor(code: LabSeatErrorCode, message: string) {
+    super(`[lab_seat:${code}] ${message}`);
+    this.name = 'LabSeatError';
+    this.code = code;
+  }
+}
+
+export function labError(code: LabSeatErrorCode, message: string): never {
+  throw new LabSeatError(code, message);
+}
+
 // CSV 字段转义：RFC 4180。实现见 src/csv.ts；通过顶层 import 引入。
 // 同时供 test/csv.test.mjs 独立验证。
 
@@ -67,7 +96,7 @@ export default {
   manifest: {
     id: '@aymwoo/plugin-lab-seat',
     name: '机房座位管理',
-    version: '0.6.0',
+    version: '0.6.1',
     description: '统一机房座位管理 - 教师编排布局分配座位，学生查看座位并签到',
     author: 'aymwoo',
     main: 'index.js',
@@ -223,6 +252,25 @@ export default {
          PRIMARY KEY (lesson_id, lab_id)
        )
      `).run();
+     // 查询索引（v0.6.x P0 性能）：高频 WHERE 列建索引。幂等。
+     sqliteDb.prepare(
+       `CREATE INDEX IF NOT EXISTS idx_ls_assign_lesson ON ${ctx.db.table('seat_assignments')} (lesson_id)`
+     ).run();
+     sqliteDb.prepare(
+       `CREATE INDEX IF NOT EXISTS idx_ls_assign_lesson_lab ON ${ctx.db.table('seat_assignments')} (lesson_id, lab_id)`
+     ).run();
+     sqliteDb.prepare(
+       `CREATE INDEX IF NOT EXISTS idx_ls_attend_lesson ON ${ctx.db.table('attendance_records')} (lesson_id)`
+     ).run();
+     sqliteDb.prepare(
+       `CREATE INDEX IF NOT EXISTS idx_ls_sessions_lesson_status ON ${ctx.db.table('check_in_sessions')} (lesson_id, status)`
+     ).run();
+     sqliteDb.prepare(
+       `CREATE INDEX IF NOT EXISTS idx_ls_templates_lab ON ${ctx.db.table('seat_templates')} (lab_id)`
+     ).run();
+     sqliteDb.prepare(
+       `CREATE INDEX IF NOT EXISTS idx_ls_room_map_lesson ON ${ctx.db.table('lesson_room_map')} (lesson_id)`
+     ).run();
    });
 
     // ── 表名引用 ──────────────────────────────────────
@@ -449,15 +497,15 @@ export default {
         const p = command.payload as any;
         const students = getStudentsByLesson(p.lessonId);
         if (!students || students.length === 0) {
-          throw new Error('未找到该课节的学生');
+          labError('LESSON_NO_STUDENTS', '未找到该课节的学生');
         }
 
         // 模板只能应用在单个机房（模板绑定 lab_id）
         if (p.templateId) {
           const tmpl = rawDb.prepare(`SELECT * FROM ${T_TEMPLATES} WHERE id = ?`).get(p.templateId);
-          if (!tmpl) throw new Error('模板不存在');
+          if (!tmpl) labError('TEMPLATE_NOT_FOUND', '模板不存在');
           const labId = tmpl.lab_id;
-          if (!getLabLayout(labId)) throw new Error('模板机房不存在');
+          if (!getLabLayout(labId)) labError('ROOM_NOT_FOUND', '模板机房不存在');
           const assignments = JSON.parse(tmpl.assignments_json);
           const delStmt = rawDb.prepare(`DELETE FROM ${T_ASSIGN} WHERE lesson_id = ? AND lab_id = ?`);
           const insStmt = rawDb.prepare(`INSERT OR REPLACE INTO ${T_ASSIGN}
@@ -483,15 +531,15 @@ export default {
         const labIds: string[] = Array.isArray(p.labIds) && p.labIds.length > 0
           ? p.labIds
           : (p.labId ? [p.labId] : []);
-        if (labIds.length === 0) throw new Error('未指定机房');
+        if (labIds.length === 0) labError('NO_LAB_SELECTED', '未指定机房');
         const layouts = labIds.map(id => {
           const layout = getLabLayout(id);
-          if (!layout) throw new Error(`机房不存在: ${id}`);
+          if (!layout) labError('ROOM_NOT_FOUND', `机房不存在: ${id}`);
           return layout;
         });
         const totalSeats = layouts.reduce((sum, l) => sum + l.cells.filter(c => c.type !== 'none').length, 0);
         if (students.length > totalSeats) {
-          throw new Error(`可用座位不足：需要 ${students.length}，仅 ${totalSeats} 个（可添加更多机房）`);
+          labError('SEATS_INSUFFICIENT', `可用座位不足：需要 ${students.length}，仅 ${totalSeats} 个（可添加更多机房）`);
         }
 
         // 策略排序（仅对多机房有意义；单机房保持原行为）
@@ -574,12 +622,12 @@ export default {
     ): Promise<number> {
       const layouts = labIds.map(id => {
         const layout = getLabLayout(id);
-        if (!layout) throw new Error(`机房不存在: ${id}`);
+        if (!layout) labError('ROOM_NOT_FOUND', `机房不存在: ${id}`);
         return layout;
       });
       const totalSeats = layouts.reduce((sum, l) => sum + l.cells.filter(c => c.type !== 'none').length, 0);
       if (ordered.length > totalSeats) {
-        throw new Error(`可用座位不足：需要 ${ordered.length}，仅 ${totalSeats} 个（可添加更多机房）`);
+        labError('SEATS_INSUFFICIENT', `可用座位不足：需要 ${ordered.length}，仅 ${totalSeats} 个（可添加更多机房）`);
       }
       const now = Date.now();
       const delStmt = rawDb.prepare(`DELETE FROM ${T_ASSIGN} WHERE lesson_id = ? AND lab_id = ?`);
@@ -752,7 +800,7 @@ export default {
         const session = rawDb.prepare(
           `SELECT * FROM ${T_SESSIONS} WHERE lesson_id = ? AND status = 'open'`
         ).get(lessonId);
-        if (!session) throw new Error('签到尚未开启');
+        if (!session) labError('CHECKIN_NOT_OPEN', '签到尚未开启');
 
         // 幂等检查
         const existing = rawDb.prepare(
@@ -760,6 +808,14 @@ export default {
         ).get(lessonId, studentId);
         if (existing) {
           return { message: '已签到', status: (existing as any).status, checkedInAt: (existing as any).checked_in_at };
+        }
+
+        // 防刷：只允许本课节已分配座位的学生签到
+        const assigned = rawDb.prepare(
+          `SELECT id FROM ${T_ASSIGN} WHERE lesson_id = ? AND student_id = ?`
+        ).get(lessonId, studentId);
+        if (!assigned) {
+          labError('NO_ASSIGNMENT', '你尚未被分配该课节的座位，请联系老师');
         }
 
         // 判断是否迟到
@@ -1053,7 +1109,7 @@ export default {
         const assign = rawDb.prepare(
           `SELECT lab_id FROM ${T_ASSIGN} WHERE lesson_id = ? LIMIT 1`
         ).get(p.lessonId);
-        if (!assign) throw new Error('该课节未分配座位');
+        if (!assign) labError('LESSON_NO_ASSIGN', '该课节未分配座位');
         // 重走随机分配
         // 使用 manifest.id 前缀确保 Worker 环境下类型匹配
         return commandBus.execute({
@@ -1088,15 +1144,15 @@ export default {
       async execute(command) {
         const p = command.payload as any;
         const instruction = String(p.instruction || '').trim();
-        if (!instruction) throw new Error('请提供座位安排要求 (instruction)');
+        if (!instruction) labError('SMART_NO_INSTRUCTION', '请提供座位安排要求 (instruction)');
 
         const labIds: string[] = Array.isArray(p.labIds) && p.labIds.length > 0
           ? p.labIds
           : (p.labId ? [p.labId] : []);
-        if (labIds.length === 0) throw new Error('未指定机房 (labIds 或 labId)');
+        if (labIds.length === 0) labError('NO_LAB_SELECTED', '未指定机房 (labIds 或 labId)');
 
         const students = getStudentsByLesson(p.lessonId);
-        if (!students || students.length === 0) throw new Error('未找到该课节的学生');
+        if (!students || students.length === 0) labError('LESSON_NO_STUDENTS', '未找到该课节的学生');
 
         // 1) 若指定按活动分组，先为每个学生标注 group_id（供排序保持组邻座）
         let annotated = students;
@@ -1108,14 +1164,14 @@ export default {
         // 2) AI 翻译约束
         const ai = (ctx.services as any).ai;
         if (!ai || typeof ai.generateText !== 'function') {
-          throw new Error('AI 服务不可用，无法进行智能排座（可改用 assign_seats 自动/手动分配）');
+          labError('AI_UNAVAILABLE', 'AI 服务不可用，无法进行智能排座（可改用 assign_seats 自动/手动分配）');
         }
         const { prompt, systemInstruction } = buildSmartPrompt(annotated, instruction);
         let raw: string;
         try {
           raw = await ai.generateText(prompt, { systemInstruction, temperature: 0.2 });
         } catch (e: any) {
-          throw new Error(`AI 调用失败：${e?.message || e}`);
+          labError('AI_CALL_FAILED', `AI 调用失败：${e?.message || e}`);
         }
         const constraint = parseSmartConstraint(raw);
         const { unknown } = validateConstraintNames(constraint, annotated);
