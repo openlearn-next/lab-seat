@@ -4,6 +4,91 @@ All notable changes to the **机房座位管理（Lab Seat Management）Plugin**
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.6.1] - 2026-09-06
+
+### Added
+- **查询索引（P0 性能）**：为 `seat_assignments(lesson_id)` / `seat_assignments(lesson_id,lab_id)` / `attendance_records(lesson_id)` / `check_in_sessions(lesson_id,status)` / `seat_templates(lab_id)` / `lesson_room_map(lesson_id)` 建 `CREATE INDEX IF NOT EXISTS`（幂等）。高频 WHERE 不再线性扫表。
+- **统一错误规范（P1）**：新增 `LabSeatError` / `labError(code, msg)`，15 处 handler `throw` 全部迁移为带 `[lab_seat:CODE]` 前缀 + `err.code` 的错误（LESSON_NO_STUDENTS / ROOM_NOT_FOUND / SEATS_INSUFFICIENT / CHECKIN_NOT_OPEN / NO_ASSIGNMENT / AI_* 等）。前端 `humanizeErr()` 剥离前缀只显示可读中文。
+- **签到防刷（P1）**：学生自助签到前校验其在本课节 `seat_assignments` 中已分配，未分配学生（含外部 actorId 探测 lessonId）返回 `NO_ASSIGNMENT`，杜绝任意 ID 签到。重复签到仍走幂等「已签到」友好返回。
+
+### Fixed
+- 前端错误文案不再带 `[lab_seat:CODE]` 技术前缀（三处 catch 改为 humanizeErr）。
+- README「已知问题」更新为瘦身后的准确状态（bundle ~0.2 MB，SDK 修复落地记录见 docs/sdk-pr）。
+
+## [0.6.0] - 2026-09-06
+
+### Added
+- **AI 智能排座（§4.2 v1）**：新 AI Action `lab_seat-smart-assign` → command `lab_seat.smart_assign_seats`。教师用自然语言描述约束（如"近视的张小明靠前，李雷别坐第一排"）→ `ctx.services.ai.generateText` 翻译为结构化 JSON（preferFront / avoidFront / pairs / strategy）→ 确定性排序落座。纯函数逻辑独立在 `src/smart-assign.ts`（prompt 构造、容错 JSON 解析、排序、名单校验），13 个单测覆盖；AI 输出非法时回退空约束仍全分配；AI 服务不可用报明确错误。
+- **SDK bundle 瘦身提案（§1.1）**：`docs/sdk-pr/proposal.md` 完整根因链（worker 加载机制要求自包含 → SDK dist 顶层 import express/jszip/pino → cli inline 变 7.4MB）+ 三方案对比 + 推荐补丁 `0001-stop-value-exporting-host-runtime.patch`。
+- **插件 README（§5.2）**：功能总览、UI 槽位、commands/actions 表、配置项、安全说明、已知问题。
+- **Playwright E2E（§5.3）**：`test/e2e/`（mock host HTML + esbuild 单文件 bundle + chromium 交互断言）。验证：面板渲染 / 机房列表显示 mock 数据 / 课节选择器出现活跃课 / tab 切换 / 导出与趋势按钮 / 无页面错误。
+- **devDeps**: react/react-dom（仅供 E2E 二次打包；生产 bundle 仍由 host 提供）。
+
+### Changed
+- 测试体系：`pnpm test` 现跑 CSV(14) + smart-assign(13) + worker harness(21) = 48 断言；新增 `test:smart`、`e2e`、`e2e:build` scripts。
+
+## [0.5.0] - 2026-09-06
+
+### Added
+- **签到异常流程自动化（§3.2）**：新增配置 `auto_mark_leave_after_minutes`（签到开启 N 分钟未签到自动标记请假）、`late_auto_promote_after_minutes`（迟到 N 分钟未签到自动升级缺勤）、`auto_scan_interval_seconds`（扫描间隔，默认 60s）。后台 `setInterval` 周期扫描 open 会话；判定逻辑抽成可 AI/手动触发的 `lab_seat.auto_mark_absent` command（interval 仅做周期调度）。deactivate 时清理 timer。
+- **历史到课率趋势（§3.3）**：新 handler `lab_seat.attendance_trend`，按课节聚合（opened_at 锚点 / total = 该课节被分配人数 / checked/late/leave/absent / 到课率%），返回时间倒序序列。前端「历史记录」tab 新增「近 30 天到课趋势」按钮 → 纯 CSS 条形图（不引入 recharts，避免 bundle 膨胀）。
+- **活动插件联动重构（§3.4）**：分组读取抽成 `getResearchGroups(activityId)` —— 先探测 `IActivityRegistryToken` 活动生态，不存在则回退直查 `plugin_research_groups` 表，**表缺失不崩溃**（返回空分组，成员落到队列末尾仍全分配）。`ILabSeatService` 新增 `getActivitySeatMap(activityId)` 返回 学生→{labId,rowIdx,colIdx} 供活动插件展示组内座位。
+- **移除单个学生座位（§2.5 配套）**：新 command `lab_seat.unassign_student`（删除单条分配，返回 removed 布尔）。
+- **3 项新配置** 在 manifest `configuration` 中声明，插件中心「设置」页自动生成表单。
+
+### Changed
+- **事件订阅升级（§2.3）**：`subscribeToEvents` 现在带可见性感知（标签页隐藏暂停轮询省电）、in-flight 保护（handler 执行中跳过下次调度）、空闲指数退避（3s→30s 封顶）、收到真实 socket 事件立即回到快速档；保留 socketService 订阅 + 低频心跳兜底。
+- **触屏拖拽降级（§2.5）**：SeatAssignment 检测 `ontouchstart` / `maxTouchPoints` → 触屏设备自动启用「点学生 chip → 点目标座位」两步落座，不再依赖无效的 HTML5 drag；桌面仍为拖拽，且座位格/学生 chip 增加占用提示（目标被占时明确报错不覆盖）。
+- **配置读取扩展**：worker runtime 无 `ctx.config` 时已能回退 manifest default；现同时支持 mock host 注入 config 覆盖（便于测试）。
+
+### Security
+- 自动判定仅把「未签到」升级为请假、把「迟到」升级为缺勤，**不删除**已有签到记录（幂等 INSERT OR REPLACE / UPDATE，绝不触碰已 checked_in 记录）。
+
+## [0.4.0] - 2026-09-06
+
+### Added
+- **多机房并发课节（§3.1）**：新增 `lesson_room_map` 关联表，一个课节可关联多个机房。新 handlers：`lab_seat.list_lesson_labs`（含每机房已分配人数）、`lab_seat.add_lesson_lab`、`lab_seat.remove_lesson_lab`（连带清空该机房分配）。`assign_seats` 扩展支持 `labIds[]` 按容量顺序批量填充；学生数超出总座位时抛出明确错误（提示添加更多机房）。容量不足时单机房报错提示同样明确。
+- **多机房查询过滤**：`get_assignments` / `get_attendance` 支持 `labId` 可选参数，按机房返回；`export_attendance` 支持 labId 且 CSV 新增「机房」列（修复原 handler 引用了未 SELECT 的 `lab_id` 的既存 bug）。
+- **图形化座位布局编辑器（§2.4）**：机房列表新增「编辑布局」入口 → `LayoutEditor` 组件，单击格子在 desktop/notebook/none 间循环、双击打开详情编辑 IP/备注、实时统计各类型数量、保存调 `update_layout`。
+- **前端 teacher.tab JSX 化（§2.1）**：整个 `frontend.tsx` 由 `React.createElement` 迁移到 JSX（经典模式 `jsx:react`），可读性/类型推导/可维护性显著提升；React 仍正确 external，未打入 bundle。
+- **worker 兼容性测试 harness（§1.2）**：`test/plugin.test.mjs` 用真实 better-sqlite3 + mock CommandBus/EventBus/ActionRegistry/DI 模拟 host Worker runtime，覆盖全新安装 / 升级安装 / 幂等迁移 / 全部命令注册 / 关键业务链路（create_room→list_rooms、assign→open_check_in→check_in、积分服务缺失降级、ILabSeatService provide、特殊字符 CSV 导出、update_layout、多机房批量分配与容量不足、list_lessons 容错）。
+- **测试脚本体系**：`pnpm test`（构建 test-bundle + csv + plugin 两套测试，27 断言全绿）、`pnpm test:csv`、`pnpm test:plugin`、`pnpm build:test-bundle`；`test/build-test-bundle.mjs` 用 esbuild stub SDK inline 的 pino/express/jszip/semver/uuid 等 runtime 依赖使 bundle 可在 Node 直接 import。
+
+### Fixed
+- **fresh install 崩溃**：原代码在 `computer_labs` 表不存在时直接 `UPDATE computer_labs SET name = room_number` 会抛 `no such table`。改为先 `CREATE TABLE IF NOT EXISTS computer_labs` 再用 try/catch 包 UPDATE（§1.2 测试暴露）。
+- **create_room 丢失 room_number**：原 INSERT 把 `p.name` 同时写入 `room_number` 和 `name` 两列，导致 `room_number` 永远等于 name。修正为 `p.room_number` 写入编号列、`name` 缺省回退编号。
+- **assign_seats 的 prepare().run() 误用**：`rawDb.prepare(sql).run()` 返回 RunResult 而非 Statement，随后的 `delStmt.run(...)`/`insStmt.run(...)` 永远抛错（“Too few parameter values”）。重构为 `.prepare()` 存 Statement 再 `.run()`。
+- **export_attendance 引用未 SELECT 列**：原 SELECT 未包含 `lab_id` 却用 `r.lab_id` 查机房布局（永远 undefined → 座位号回退成 “row-col”）。已补列并额外输出机房名。
+- **测试 fixture 修复**：`assert.doesNotReject` 不改写返回值导致的误断言等。
+
+### Security
+- **`test/_mock-pino.mjs` 仅用于测试环境**；生产 bundle 仍由 SDK inline，无变化。
+
+## [0.3.0] - 2026-09-06
+
+### Changed
+- **SDK 升级到 `@openlearn/plugin-sdk@^3.5.2`**：对齐最新文档（`@openlearn/plugin-sdk@3.5.0` 适用范围）。补充 SDK 运行时依赖（pino / uuid / express / semver / jszip）到 `devDependencies`，使构建产物解析完整。
+- **manifest 新增 `main`、`optional`、`provides`、`updateSource` 字段**：`main: 'index.js'` 满足 Manifest 接口要求；`optional: [IPointsLedgerService]` 声明积分服务为可选依赖；`provides: [ILabSeatService]` 让其他插件显式订阅本插件服务；`updateSource.type: 'github-release'` 启用插件中心远端版本检测。
+- **前端事件订阅重构成 `subscribeToEvents` helper**：前端 bundle 不再依赖 `ctx.services.socketService` 是否存在；host 旧版本（无 socketService）自动降级到 5s 轮询，避免在某些 host 版本下事件不触发。
+- **CSV 下载重构成 `downloadCsv` helper**：优先使用 `ctx.services.uiService.downloadFile` 走 host 原生 toast / 进度；不可用时降级为浏览器原生 `<a download>` Blob 下载，不再因 `uiService` 缺失导致导出按钮静默失效。
+- **新增 `lab_seat.list_lessons` command + AI action**（§2.2）：教师 Tab 顶部加 `LessonPicker` 控件。教师不再手动输 lessonId  UUID，可从下拉菜单选当前活跃 / 最近课节。动态探测 host `lessons` 表 schema 演进后列名变化（用 `PRAGMA table_info`）保证兼容性。AI Agent 可调用同一个 command 查询课节列表。
+- **CSV 导出按 RFC 4180 转义**（§1.3）：学生姓名含逗号 / 双引号 / 换行时导出文件不再被 Excel 解析为多行 / 多列。新增 `escapeCsvField` / `csvRow` 工具函数（独立 `src/csv.ts`），附 14 个单元测试覆盖中英文逗号 / 引号嵌套 / `\r\n` / `null` / 数字等边界场景。
+
+### Added
+- **`pnpm test` / `pnpm test:watch` 脚本**：运行 `node --test test/csv.test.mjs`，不依赖 SDK 构建产物。14/14 测试通过。
+- **新文件 `src/csv.ts`**：独立的 CSV 工具模块，便于复用与测试。
+
+### Fixed
+- **`@openlearn/core:IPointsLedgerService` 字面量 token 替换为 `IPointsLedgerServiceToken`**：之前用 `{ name: '@openlearn/core:IPointsLedgerService' } as any` 绕过类型系统；现在改用 SDK 导出的强类型 Token 实例，类型推断更准确、与 SDK 其它 28 个 Token 风格统一。
+- **`@aymwoo/plugin-lab-seat:ILabSeatService` 字面量 token 替换为 `Token<T>` 强类型实例**：在文件顶部 `const ILabSeatServiceToken = new Token<ILabSeatService>(...)`，并新增 `ILabSeatService` 接口定义，供其他插件 `ctx.resolve(ILabSeatServiceToken)` 时类型推断。
+- **`/home/wuxf/Develop/openlearn-plugins/lab-seat/src/components/PluginCenter.tsx` 移出插件源码**：该 1783 行文件是从宿主 `App.tsx` 提取出来的插件管理 UI（注释明确说明），引用了 `./LegacyPluginBadge`、`./PluginSettingsModal`、`./PluginInstallWizard`、`../plugin-host/plugin-host-store`、`../i18n` 等宿主应用私有路径。如果未来任何文件误 `import` 它，将导致 SDK 构建因模块缺失失败。现已移至 `docs/extracted-from-host/PluginCenter.tsx` 作为参考保留。
+- **包体积污染修复**：之前 `package.json` 把 `express` / `jszip` / `pino` / `semver` / `uuid` 错误归类为 `devDependencies`，而 SDK 设计上需要这些库作为 inline 的 runtime 依赖。新版本明确这些是 SDK 必需的 transitive 依赖，构建时 SDK 会自动 inline 它们。
+
+### Known Issues
+- **服务端 bundle 体积（7.6 MB）偏大**：SDK 3.5.2 仍把 `@openlearn/plugin-sdk` dist（包含整个 plugin-runtime + PluginDistributionManager / ConfigService / Logger / EventBus 内部）inline 进 plugin bundle，连带拉入 `express` / `jszip` / `pino` / `uuid` / `semver`。这是 SDK 客户端设计问题（`external: ['@openlearn/plugin-sdk']` 被 `onResolve` 返回本地路径覆盖），需要 SDK 官方修复 `cli.mjs:222-242` 的 onResolve 回调（应同时返回 `external: true`）。详见 `ROADMAP.md` §1.1。
+
+## [0.2.0] - 2026-07-27
+
 ## [0.2.0] - 2026-07-27
 
 ### Changed
