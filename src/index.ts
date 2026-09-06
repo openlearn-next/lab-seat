@@ -9,6 +9,9 @@ import {
   Token,
 } from '@openlearn/plugin-sdk';
 import { escapeCsvField, csvRow } from './csv.js';
+import {
+  buildSmartPrompt, parseSmartConstraint, orderStudentsForSeats, validateConstraintNames,
+} from './smart-assign.js';
 
 // ── Types ──────────────────────────────────────────────
 interface LabRoom {
@@ -64,7 +67,7 @@ export default {
   manifest: {
     id: '@aymwoo/plugin-lab-seat',
     name: '机房座位管理',
-    version: '0.5.0',
+    version: '0.6.0',
     description: '统一机房座位管理 - 教师编排布局分配座位，学生查看座位并签到',
     author: 'aymwoo',
     main: 'index.js',
@@ -560,6 +563,51 @@ export default {
       ).run(lessonId, labId, Date.now());
     }
 
+    // §4.2 内部落座核心：清空指定机房旧分配 → 依顺序填入 → 登记 map → 返回人数。
+    // 由 smart_assign_seats 使用（AI 先给出排序后的学生）。
+    async function persistOrderedSeats(
+      lessonId: string,
+      ordered: Array<{ id: string; group_id?: string }>,
+      labIds: string[],
+      strategyLabel: string,
+      correlationId?: string,
+    ): Promise<number> {
+      const layouts = labIds.map(id => {
+        const layout = getLabLayout(id);
+        if (!layout) throw new Error(`机房不存在: ${id}`);
+        return layout;
+      });
+      const totalSeats = layouts.reduce((sum, l) => sum + l.cells.filter(c => c.type !== 'none').length, 0);
+      if (ordered.length > totalSeats) {
+        throw new Error(`可用座位不足：需要 ${ordered.length}，仅 ${totalSeats} 个（可添加更多机房）`);
+      }
+      const now = Date.now();
+      const delStmt = rawDb.prepare(`DELETE FROM ${T_ASSIGN} WHERE lesson_id = ? AND lab_id = ?`);
+      const insStmt = rawDb.prepare(`INSERT OR REPLACE INTO ${T_ASSIGN}
+        (id, lesson_id, student_id, lab_id, row_idx, col_idx, group_id, assigned_strategy, assigned_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      for (const lid of labIds) delStmt.run(lessonId, lid);
+      let cursor = 0;
+      for (let li = 0; li < labIds.length && cursor < ordered.length; li++) {
+        const seats = layouts[li].cells.filter(c => c.type !== 'none');
+        for (const seat of seats) {
+          if (cursor >= ordered.length) break;
+          const s: any = ordered[cursor++];
+          insStmt.run(uid(), lessonId, s.id, labIds[li], seat.row, seat.col, s.group_id || '', strategyLabel, now);
+        }
+      }
+      for (const lid of labIds) upsertLessonRoom(lessonId, lid);
+      const count = rawDb.prepare(
+        `SELECT COUNT(*) as cnt FROM ${T_ASSIGN} WHERE lesson_id = ? AND lab_id IN (${labIds.map(() => '?').join(',')})`
+      ).get(lessonId, ...labIds) as any;
+      await eventBus.publish({
+        id: uid(), type: 'lab_seat.seats_assigned', source: `plugin.${pluginId}`,
+        payload: { lessonId, labId: labIds.length === 1 ? labIds[0] : null, labIds, count: count.cnt, strategy: strategyLabel },
+        timestamp: Date.now(), correlationId,
+      });
+      return count.cnt;
+    }
+
     // §3.1 查询课节已关联 / 已分配机房列表（含已分配人数）
     await commandBus.registerHandler('lab_seat.list_lesson_labs', {
       async execute(command) {
@@ -1013,6 +1061,82 @@ export default {
           payload: { lessonId: p.lessonId, labId: (assign as any).lab_id, strategy: 'random' },
           actorId: command.actorId,
         } as any);
+      },
+    });
+
+    // ── 8.5 AI 智能排座（§4.2 v1） ────────────────────
+    // 教师用自然语言描述约束 → LLM 翻译为结构化约束 → 确定性排序落座。
+    await actionRegistry.register({
+      id: 'lab_seat-smart-assign',
+      commandType: 'lab_seat.smart_assign_seats',
+      description: '根据教师自然语言要求智能分配座位（如：近视的张小明坐前面、李雷别坐第一排、按研究小组坐）。需要 AI 服务可用。',
+      capabilityRequired: 'lab_seat:write',
+      inputSchema: {
+        type: 'OBJECT',
+        properties: {
+          lessonId: { type: 'STRING', description: '课节 ID' },
+          labIds: { type: 'ARRAY', description: '目标机房 ID 列表（多机房按容量顺序填充）' },
+          labId: { type: 'STRING', description: '单个机房 ID（与 labIds 二选一）' },
+          activityId: { type: 'STRING', description: '要按小组坐时的研究活动 ID' },
+          instruction: { type: 'STRING', description: '座位安排的自然语言要求，例如“让近视的张小明靠前，李雷不要坐第一排”' },
+        },
+        required: ['lessonId', 'instruction'],
+      },
+    });
+
+    await commandBus.registerHandler('lab_seat.smart_assign_seats', {
+      async execute(command) {
+        const p = command.payload as any;
+        const instruction = String(p.instruction || '').trim();
+        if (!instruction) throw new Error('请提供座位安排要求 (instruction)');
+
+        const labIds: string[] = Array.isArray(p.labIds) && p.labIds.length > 0
+          ? p.labIds
+          : (p.labId ? [p.labId] : []);
+        if (labIds.length === 0) throw new Error('未指定机房 (labIds 或 labId)');
+
+        const students = getStudentsByLesson(p.lessonId);
+        if (!students || students.length === 0) throw new Error('未找到该课节的学生');
+
+        // 1) 若指定按活动分组，先为每个学生标注 group_id（供排序保持组邻座）
+        let annotated = students;
+        if (p.activityId) {
+          const map = await buildStudentGroupMap(students, p.activityId);
+          annotated = students.map((s: any) => ({ ...s, group_id: map.get(s.id) || '' }));
+        }
+
+        // 2) AI 翻译约束
+        const ai = (ctx.services as any).ai;
+        if (!ai || typeof ai.generateText !== 'function') {
+          throw new Error('AI 服务不可用，无法进行智能排座（可改用 assign_seats 自动/手动分配）');
+        }
+        const { prompt, systemInstruction } = buildSmartPrompt(annotated, instruction);
+        let raw: string;
+        try {
+          raw = await ai.generateText(prompt, { systemInstruction, temperature: 0.2 });
+        } catch (e: any) {
+          throw new Error(`AI 调用失败：${e?.message || e}`);
+        }
+        const constraint = parseSmartConstraint(raw);
+        const { unknown } = validateConstraintNames(constraint, annotated);
+        if (unknown.length > 0) {
+          ctx.log.warn(`[smart-assign] 约束中姓名未匹配名单，已忽略: ${unknown.join(', ')}`);
+        }
+        // 按活动分组要求合并进 constraint.strategy
+        if (p.activityId) constraint.strategy = 'activity';
+
+        // 3) 确定性排序 + 落座
+        const ordered = orderStudentsForSeats(annotated, constraint);
+        const count = await persistOrderedSeats(
+          p.lessonId, ordered, labIds, 'smart', command.id,
+        );
+        return {
+          message: `智能排座完成：已为 ${count} 名学生分配座位`,
+          strategy: constraint.strategy,
+          preferFront: constraint.preferFront,
+          avoidFront: constraint.avoidFront,
+          unknownNames: unknown,
+        };
       },
     });
 

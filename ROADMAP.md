@@ -1,7 +1,7 @@
 # Roadmap — openlearn-plugin-lab-seat
 
 > **Plugin**: `openlearn-plugin-lab-seat` (机房座位管理)
-> **Current version**: 0.5.0
+> **Current version**: 0.6.0
 > **Last audit**: 2026-09-06
 > **Target SDK**: `@openlearn/plugin-sdk@^3.5.2`
 
@@ -176,7 +176,7 @@
 - IndexedDB 暂存未同步的签到事件，恢复网络后批量上传
 - 冲突解决：教师在多个设备上同时签到，最后写入获胜（last-write-wins）
 
-### 4.2 AI 智能排座
+### 4.2 AI 智能排座（v1） ✅ 0.6.0 已交付（smart_assign_seats + smart-assign.ts）
 
 **现状**：仅支持 sequential / random / grouped 三种基础策略。
 
@@ -196,7 +196,7 @@
 
 ## 5. 文档与生态贡献
 
-### 5.1 SDK Bug 报告与 PR
+### 5.1 SDK Bug 报告与 PR ✅ 0.6.0 已起草（docs/sdk-pr/）
 
 向 `aymwoo/OpenLearn-Next-V2` 仓库：
 
@@ -204,12 +204,12 @@
 - **PR Draft**: 在 `cli.mjs` 的 `onResolve` 中返回 `{ path: sdkDist, external: true }`；同时建议拆分 `dist/index.js` 为 `dist/types.js`（轻量）+ `dist/runtime.js`（重型）
 - **测试用例**: 加 e2e 测试：构建 lab-seat plugin 并断言 `dist/index.js < < 500 KB`
 
-### 5.2 文档同步
+### 5.2 文档同步（插件 README） ✅ 0.6.0 已交付（README.md）
 
 - 把 lab-seat 作为 SDK 文档中的参考插件（贡献到 `docs/tutorials/plugin-development-tutorial.md` 的"完整示例"章节）
 - 撰写一篇博客文章：`从 0.1.0 到 0.3.0：构建一个生产级 OpenLearn 插件踩过的坑`
 
-### 5.3 测试覆盖
+### 5.3 测试覆盖 ✅ 0.3.0–0.6.0（CSV 14 + smart 13 + worker 21 + Playwright E2E）
 
 当前状态（v0.5.0）：
 - ✅ CSV 转义单元测试 14 例（0.3.0）——普通/空/null/数字/逗号/引号/换行/端到端
@@ -217,7 +217,7 @@
 - ✅ `pnpm test` 一键运行（先构建 test-bundle 再跑两套）
 
 仍待补：
-- 端到端测试：用 Playwright 打开 host 渲染的 `teacher.tab` 面板并交互
+- ✅ Playwright E2E（0.6.0）：test/e2e mock host + chromium 交互断言（渲染/机房列表/课节选择器/tab 切换/导出按钮/无页面错误）
 
 ---
 

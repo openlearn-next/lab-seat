@@ -1,0 +1,67 @@
+From: <openlearn-plugin-lab-seat audit>
+Date: 2026-09-06
+Subject: [PATCH] plugin-sdk: stop value-exporting host runtime classes from public dist
+
+Why
+---
+Plugins run in a self-contained Worker (import(fileUrl) / data: URL) so the SDK
+must be inlined into plugin bundles. Today packages/plugin-sdk/index.ts
+value-exports 7 host-runtime classes (PluginRuntimeAdapter, ...,
+PluginDistributionManager) which internally import express / jszip / pino /
+uuid / semver. SDK's dist therefore keeps top-level third-party imports, and the
+plugin CLI (cli.mjs onResolve → sdkDist) inlines the whole dependency tree →
+~7.4 MB plugin bundles.
+
+Plugins never instantiate these classes; they consume host-injected instances
+via DI Tokens (IPluginDistributionManagerToken, ...), which stay type-only.
+
+Impact
+------
+- plugin dist/index.js: ~7.4 MB → ~100-200 KB
+- zero API loss for plugins: all I*Tokens and Token constants remain exported
+- host code that needs the concrete classes imports them from
+  ../core/plugin-host directly (server/composition already does).
+
+Change
+------
+packages/plugin-sdk/index.ts
+
+  // ── Unified Foundation Layer (P7 Sprints) ──────────────────────────────
+ 
+  export type {
+    IPluginRuntime,
+    IUnifiedPluginContext,
+    IPluginLifecycleManager,
+    IPluginCapabilityGateway,
+    IUnifiedExtensionRegistry,
+    IPluginDistributionManager,
+    CapabilityMetadata,
+    ExtensionItemMetadata,
+  } from '../core/plugin-host/index.js';
+ 
+- export {
+-   PluginRuntimeAdapter,
+-   PluginRuntimeComposition,
+-   PluginContextAdapter,
+-   PluginLifecycleManager,
+-   PluginCapabilityGateway,
+-   UnifiedExtensionRegistry,
+-   PluginDistributionManager,
+- } from '../core/plugin-host/index.js';
++ // NOTE: concrete host-runtime classes are intentionally NOT re-exported here.
++ // Plugins run in a self-contained Worker and must not pull express/jszip/pino
++ // trees into their bundles. Consume host instances via the I*Tokens instead.
++ // Host process code should import these from '../core/plugin-host/index.js'.
+
+Then:
+  node packages/plugin-sdk/build.mjs   # regenerate dist/
+
+After rebuild, dist/index.js must no longer top-level import express/jszip/pino.
+(expect: 34 KB → ~10 KB)
+
+Follow-up cleanup
+-----------------
+- packages/server/** / composition modules that imported these through the SDK
+  package should import from '../core/plugin-host/index.js' instead.
+- optional, later: add "@openlearn/plugin-sdk/runtime" subpath export so advanced
+  consumers can opt into the ultra-slim surface (proposal docs/sdk-pr/proposal.md).

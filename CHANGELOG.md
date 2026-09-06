@@ -4,6 +4,18 @@ All notable changes to the **机房座位管理（Lab Seat Management）Plugin**
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.6.0] - 2026-09-06
+
+### Added
+- **AI 智能排座（§4.2 v1）**：新 AI Action `lab_seat-smart-assign` → command `lab_seat.smart_assign_seats`。教师用自然语言描述约束（如"近视的张小明靠前，李雷别坐第一排"）→ `ctx.services.ai.generateText` 翻译为结构化 JSON（preferFront / avoidFront / pairs / strategy）→ 确定性排序落座。纯函数逻辑独立在 `src/smart-assign.ts`（prompt 构造、容错 JSON 解析、排序、名单校验），13 个单测覆盖；AI 输出非法时回退空约束仍全分配；AI 服务不可用报明确错误。
+- **SDK bundle 瘦身提案（§1.1）**：`docs/sdk-pr/proposal.md` 完整根因链（worker 加载机制要求自包含 → SDK dist 顶层 import express/jszip/pino → cli inline 变 7.4MB）+ 三方案对比 + 推荐补丁 `0001-stop-value-exporting-host-runtime.patch`。
+- **插件 README（§5.2）**：功能总览、UI 槽位、commands/actions 表、配置项、安全说明、已知问题。
+- **Playwright E2E（§5.3）**：`test/e2e/`（mock host HTML + esbuild 单文件 bundle + chromium 交互断言）。验证：面板渲染 / 机房列表显示 mock 数据 / 课节选择器出现活跃课 / tab 切换 / 导出与趋势按钮 / 无页面错误。
+- **devDeps**: react/react-dom（仅供 E2E 二次打包；生产 bundle 仍由 host 提供）。
+
+### Changed
+- 测试体系：`pnpm test` 现跑 CSV(14) + smart-assign(13) + worker harness(21) = 48 断言；新增 `test:smart`、`e2e`、`e2e:build` scripts。
+
 ## [0.5.0] - 2026-09-06
 
 ### Added

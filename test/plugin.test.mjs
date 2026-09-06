@@ -63,7 +63,13 @@ function createMockContext(db, extraConfig) {
       capability: {},
       processManager: {},
       storage: {},
-      ai: {},
+      // mock AI：默认不可用（generateText 抛错）；传入 extraConfig.aiOutput 时返回固定输出
+      ai: (() => {
+        const out = extraConfig?.aiOutput;
+        return out !== undefined
+          ? { async generateText() { return out; } }
+          : {};
+      })(),
     },
 
     resolve: async (token) => {
@@ -285,6 +291,7 @@ test('activate 注册所有 commands / actions', async () => {
     'lab_seat.export_attendance',
     'lab_seat.attendance_trend',
     'lab_seat.shuffle_seats',
+    'lab_seat.smart_assign_seats',
     'lab_seat.save_template',
     'lab_seat.list_templates',
     'lab_seat.get_current_lesson_attendance',
@@ -312,6 +319,7 @@ test('activate 注册所有 commands / actions', async () => {
     'lab_seat-export-report',
     'lab_seat-shuffle-seats',
     'lab_seat-list-lessons',
+    'lab_seat-smart-assign',
   ];
   const actionIds = mock.actionDescriptors.map(a => a.id);
   for (const id of expectedActions) {
@@ -793,4 +801,82 @@ test('exports 提供且可解析（带 & 等特殊字符的姓名）', async () 
   assert.match(result.csv, /"李""四"/, '含双引号字段应正确转义');
   // 含换行符的姓名应被引号包裹
   assert.match(result.csv, /"王\n五"/, '含换行字段应被引号包裹');
+});
+test('§4.2 smart_assign_seats：AI 约束落座', async () => {
+  createHostSchema(db);
+  db.exec(`
+    INSERT INTO users (id, name, role) VALUES
+      ('s1', '张小明', 'student'), ('s2', '李雷', 'student'),
+      ('s3', '韩梅梅', 'student'), ('s4', '王芳', 'student'), ('s5', '赵六', 'student');
+    INSERT INTO lessons (id, name, status) VALUES ('l-1', 'Test', 'live');
+    INSERT INTO classes (id) VALUES ('c-1');
+    INSERT INTO class_students (class_id, student_id) VALUES
+      ('c-1', 's1'), ('c-1', 's2'), ('c-1', 's3'), ('c-1', 's4'), ('c-1', 's5');
+    INSERT INTO computer_labs (id, room_number, rows, cols) VALUES ('lab-A', 'A101', 2, 4);
+  `);
+  // mock AI 返回：张小明靠前、李雷靠后
+  ctx = createMockContext(db, {
+    aiOutput: '{"preferFront":["张小明"],"avoidFront":["李雷"],"spread":false,"strategy":null}',
+  });
+  mock = ctx.__test__;
+  await plugin.activate(ctx);
+
+  const smart = mock.commandHandlers.get('lab_seat.smart_assign_seats');
+  const res = await smart.execute({
+    type: 'lab_seat.smart_assign_seats', actorId: 't-1',
+    payload: { lessonId: 'l-1', labId: 'lab-A', instruction: '张小明近视坐前面，李雷别坐第一排' },
+  });
+  assert.ok(res.message.includes('5'), '5 名学生应被分配');
+
+  // 张小明应坐 (0,0)（第一个座位），李雷应在靠后位置
+  const seatOf = (sid) => db.prepare(
+    `SELECT row_idx, col_idx FROM plugin_lab_seat_seat_assignments WHERE lesson_id = 'l-1' AND student_id = ?`).get(sid);
+  const zhang = seatOf('s1');
+  const lilei = seatOf('s2');
+  assert.deepEqual({ r: zhang.row_idx, c: zhang.col_idx }, { r: 0, c: 0 }, 'preferFront 学生坐第一座');
+  assert.ok(lilei.row_idx >= 1, 'avoidFront 学生应在后排');
+});
+
+test('§4.2 smart_assign_seats：AI 服务不可用时报明确错误', async () => {
+  createHostSchema(db);
+  db.exec(`
+    INSERT INTO users (id, name, role) VALUES ('s1', '张小明', 'student');
+    INSERT INTO lessons (id, name, status) VALUES ('l-1', 'Test', 'live');
+    INSERT INTO classes (id) VALUES ('c-1');
+    INSERT INTO class_students (class_id, student_id) VALUES ('c-1', 's1');
+    INSERT INTO computer_labs (id, room_number, rows, cols) VALUES ('lab-A', 'A101', 1, 1);
+  `);
+  ctx = createMockContext(db); // 无 aiOutput → ai 不可用
+  mock = ctx.__test__;
+  await plugin.activate(ctx);
+
+  const smart = mock.commandHandlers.get('lab_seat.smart_assign_seats');
+  await assert.rejects(
+    () => smart.execute({
+      type: 'lab_seat.smart_assign_seats', actorId: 't-1',
+      payload: { lessonId: 'l-1', labId: 'lab-A', instruction: '随便排' },
+    }),
+    /AI 服务不可用/,
+  );
+});
+
+test('§4.2 smart_assign_seats：非法 AI 输出回退空约束仍能分配', async () => {
+  createHostSchema(db);
+  db.exec(`
+    INSERT INTO users (id, name, role) VALUES ('s1', '张小明', 'student'), ('s2', '李雷', 'student');
+    INSERT INTO lessons (id, name, status) VALUES ('l-1', 'Test', 'live');
+    INSERT INTO classes (id) VALUES ('c-1');
+    INSERT INTO class_students (class_id, student_id) VALUES ('c-1', 's1'), ('c-1', 's2');
+    INSERT INTO computer_labs (id, room_number, rows, cols) VALUES ('lab-A', 'A101', 1, 2);
+  `);
+  ctx = createMockContext(db, { aiOutput: '这根本不是JSON，随便说说' });
+  mock = ctx.__test__;
+  await plugin.activate(ctx);
+
+  const smart = mock.commandHandlers.get('lab_seat.smart_assign_seats');
+  const res = await smart.execute({
+    type: 'lab_seat.smart_assign_seats', actorId: 't-1',
+    payload: { lessonId: 'l-1', labId: 'lab-A', instruction: '随便排' },
+  });
+  assert.ok(res.message.includes('2'), '非法输出仍应分配全部学生');
 });

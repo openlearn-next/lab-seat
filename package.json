@@ -1,6 +1,6 @@
 {
   "name": "openlearn-plugin-lab-seat",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "private": true,
   "type": "module",
   "description": "机房座位管理 - 教师编排布局分配座位，学生查看座位并签到",
@@ -9,10 +9,13 @@
     "build": "openlearn-plugin-sdk build",
     "build:test-bundle": "node test/build-test-bundle.mjs",
     "clean": "rm -rf dist tmp",
-    "test": "node test/build-test-bundle.mjs && node --test test/csv.test.mjs test/plugin.test.mjs",
+    "test": "node test/build-test-bundle.mjs && node --test test/csv.test.mjs test/smart-assign.test.mjs test/plugin.test.mjs",
     "test:csv": "node --test test/csv.test.mjs",
+    "test:smart": "node --test test/smart-assign.test.mjs",
     "test:plugin": "node test/build-test-bundle.mjs && node --test test/plugin.test.mjs",
-    "test:watch": "node --test --watch test/csv.test.mjs"
+    "e2e:build": "node test/e2e/build.mjs",
+    "e2e": "node test/e2e/build.mjs && node test/e2e/run.mjs",
+    "test:watch": "node --test --watch test/csv.test.mjs test/smart-assign.test.mjs"
   },
   "dependencies": {
     "@openlearn/plugin-sdk": "^3.5.2"
@@ -28,6 +31,8 @@
     "express": "^5.2.1",
     "jszip": "^3.10.1",
     "pino": "^10.3.1",
+    "react": ">=17",
+    "react-dom": ">=17",
     "semver": "^7.8.5",
     "typescript": "^5.0.0",
     "uuid": "^14.0.1"
