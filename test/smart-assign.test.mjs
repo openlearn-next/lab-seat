@@ -130,3 +130,36 @@ test('prompt 包含名单与要求', () => {
   assert.ok(prompt.includes('近视坐前面'));
   assert.ok(systemInstruction.includes('JSON'));
 });
+
+test('pairs 邻座：配对学生在结果中相邻', () => {
+  const c = { preferFront: [], avoidFront: [], pairs: [['张小明', '韩梅梅']], spread: false, strategy: null };
+  const ordered = orderStudentsForSeats(STUDENTS, c);
+  const names = ordered.map(s => s.name);
+  const iZhang = names.indexOf('张小明');
+  const iHan = names.indexOf('韩梅梅');
+  assert.equal(Math.abs(iZhang - iHan), 1, `张小明与韩梅梅应相邻：${names.join('>')}`);
+});
+
+test('pairs 链式：A-B 与 B-C 聚成 3 连坐', () => {
+  const c = { preferFront: [], avoidFront: [], pairs: [['张小明', '李雷'], ['李雷', '王芳']], spread: false, strategy: null };
+  const ordered = orderStudentsForSeats(STUDENTS, c);
+  const names = ordered.map(s => s.name);
+  // 张小明、李雷、王芳三者连续（任一顺序）
+  const sub = ['张小明', '李雷', '王芳'].map(n => names.indexOf(n)).sort((a, b) => a - b);
+  assert.equal(sub[2] - sub[0], 2, `三人应连续：${names.join('>')}`);
+});
+
+test('pairs 与 preferFront 并存：优先组前排且组内相邻', () => {
+  const c = { preferFront: ['张小明'], avoidFront: [], pairs: [['张小明', '韩梅梅']], spread: false, strategy: null };
+  const ordered = orderStudentsForSeats(STUDENTS, c);
+  const names = ordered.map(s => s.name);
+  // 张小明是组代表，组放最前；张小明-韩梅梅相邻
+  assert.equal(names[0], '张小明', 'preferFront 组应在最前');
+  assert.equal(names[1], '韩梅梅', '配对组成员紧随其后');
+});
+
+test('pairs 引用不存在学生时忽略且不崩溃', () => {
+  const c = { preferFront: [], avoidFront: [], pairs: [['不存在', '张小明']], spread: false, strategy: null };
+  const ordered = orderStudentsForSeats(STUDENTS, c);
+  assert.equal(new Set(ordered.map(s => s.id)).size, STUDENTS.length, '不丢学生');
+});

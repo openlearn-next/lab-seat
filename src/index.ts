@@ -96,7 +96,7 @@ export default {
   manifest: {
     id: '@aymwoo/plugin-lab-seat',
     name: '机房座位管理',
-    version: '0.6.1',
+    version: '0.6.2',
     description: '统一机房座位管理 - 教师编排布局分配座位，学生查看座位并签到',
     author: 'aymwoo',
     main: 'index.js',
@@ -242,8 +242,14 @@ export default {
          created_at INTEGER NOT NULL
        )
      `).run();
-     // 课节-机房关联表（v0.4.0 §3.1 多机房）：一个课节可关联多个机房，
-     // 每个机房独立分配/查看/考勤。兼容旧数据（未登记的在 list_lesson_labs 时自动补全）。
+   });
+
+   // v2（v0.6.x）：0.4.0 新增的 lesson_room_map 表 + 0.6.1 的查询索引。
+   // host 的 migrate 只在 currentVersion < targetVersion 时执行回调；
+   // 历史各版都把 DDL 塞在 migrate(1)，导致已部署用户（migration=1）升级后
+   // 新表/新索引永不建立。拆出 migrate(2) 让老用户升级时自动补齐（幂等，新装亦安全）。
+   await ctx.db.migrate(2, async (sqliteDb: any) => {
+     // 课节-机房关联表（§3.1 多机房）
      sqliteDb.prepare(`
        CREATE TABLE IF NOT EXISTS ${ctx.db.table('lesson_room_map')} (
          lesson_id TEXT NOT NULL,
@@ -252,7 +258,7 @@ export default {
          PRIMARY KEY (lesson_id, lab_id)
        )
      `).run();
-     // 查询索引（v0.6.x P0 性能）：高频 WHERE 列建索引。幂等。
+     // 高频 WHERE 列索引（P0 性能）
      sqliteDb.prepare(
        `CREATE INDEX IF NOT EXISTS idx_ls_assign_lesson ON ${ctx.db.table('seat_assignments')} (lesson_id)`
      ).run();
@@ -337,31 +343,28 @@ export default {
 
 
     function getStudentsByLesson(lessonId: string): { id: string; name: string; student_id?: string }[] {
-      const rows = rawDb.prepare(`
-        SELECT u.id, u.name
-        FROM lessons l
-        JOIN classes c ON c.id IN (
-          SELECT value FROM json_each(
-            (SELECT value FROM json_each(l.timeline) WHERE key='class_ids')
-          )
-        )
-        JOIN class_students cs ON cs.class_id = c.id
-        JOIN users u ON u.id = cs.student_id
-        WHERE l.id = ?
-      `).all(lessonId);
-      // fallback: lessions 无 timeline 则尝试通过 classes.lab_id 关联
-      if (!rows || rows.length === 0) {
+      // 主查询：从 lessons.timeline 解析出 class_ids，再取这些班的学生。
+      // timeline 支持两种形态：{"class_ids": [...]} 对象 / 直接含 class_ids 的对象；
+      // 无法解析时返回空（宁缺毋错——不跨班 CROSS JOIN 串生，避免把别班学生分进本课节）。
+      try {
+        const lesson = rawDb.prepare(`SELECT timeline FROM lessons WHERE id = ?`).get(lessonId) as any;
+        if (!lesson || !lesson.timeline) return [];
+        let parsed: any = null;
+        try { parsed = typeof lesson.timeline === 'string' ? JSON.parse(lesson.timeline) : lesson.timeline; } catch { return []; }
+        const classIds: string[] =
+          (parsed?.class_ids || parsed?.classIds || []);
+        if (!Array.isArray(classIds) || classIds.length === 0) return [];
+        const placeholders = classIds.map(() => '?').join(',');
         return rawDb.prepare(`
           SELECT u.id, u.name
-          FROM lessons l
-          JOIN classes c ON 1=1
-          JOIN class_students cs ON cs.class_id = c.id
+          FROM class_students cs
           JOIN users u ON u.id = cs.student_id
-          WHERE l.id = ? AND u.role = 'student'
+          WHERE cs.class_id IN (${placeholders}) AND u.role = 'student'
           GROUP BY u.id
-        `).all(lessonId);
+        `).all(...classIds);
+      } catch {
+        return [];
       }
-      return rows;
     }
 
     function getLabLayout(labId: string): LabLayout | null {
@@ -1011,16 +1014,40 @@ export default {
           ORDER BY sa.lab_id, sa.row_idx, sa.col_idx
         `).all(...params);
 
+        // 预取涉及机房的信息一次（避免 N+1）：layout + display_name
+        const labIdsInvolved = [...new Set((records as any[]).map(r => r.lab_id).filter(Boolean))];
+        const labCache = new Map<string, { layout: LabLayout | null; name: string }>();
+        if (labIdsInvolved.length > 0) {
+          const labRows = rawDb.prepare(
+            `SELECT id, name, room_number, rows, cols, layout_json FROM ${T_ROOMS} WHERE id IN (${labIdsInvolved.map(() => '?').join(',')})`
+          ).all(...labIdsInvolved) as any[];
+          for (const lb of labRows) {
+            let layout: LabLayout | null = null;
+            try {
+              layout = lb.layout_json && lb.layout_json !== '{}' ? JSON.parse(lb.layout_json) : null;
+            } catch { layout = null; }
+            if (!layout && lb.rows && lb.cols) {
+              const cells: SeatCell[] = [];
+              for (let r = 0; r < lb.rows; r++) {
+                for (let c = 0; c < lb.cols; c++) {
+                  cells.push({ row: r, col: c, label: `${String.fromCharCode(65 + r)}${c + 1}`, type: 'desktop', ip: '', note: '' });
+                }
+              }
+              layout = { rows: lb.rows, cols: lb.cols, numbering: { scheme: 'alphanumeric', direction: 'row-first' }, cells };
+            }
+            labCache.set(lb.id, { layout, name: lb.name || lb.room_number || lb.id });
+          }
+        }
+
         // 表头同样过 escapeCsvField（当前都是英文+中文，不含特殊字符，但保持代码一致性）
         let csv = '\uFEFF' + csvRow(['机房', '座位编号', '学生姓名', '学号', '签到状态', '签到时间', '备注']);
         const statusMap: Record<string, string> = { checked_in: '已签到', late: '迟到', leave: '请假', absent: '未签到' };
         for (const r of records as any[]) {
-          const layout = getLabLayout(r.lab_id);
-          const label = layout?.cells?.find((c: SeatCell) => c.row === r.row_idx && c.col === r.col_idx)?.label || `${r.row_idx}-${r.col_idx}`;
-          const labName = rawDb.prepare(`SELECT COALESCE(NULLIF(name, ''), room_number) AS n FROM ${T_ROOMS} WHERE id = ?`).get(r.lab_id) as any;
+          const lab = labCache.get(r.lab_id);
+          const label = lab?.layout?.cells?.find((c: SeatCell) => c.row === r.row_idx && c.col === r.col_idx)?.label || `${r.row_idx}-${r.col_idx}`;
           const time = r.checked_in_at ? new Date(r.checked_in_at).toISOString() : '';
           csv += csvRow([
-            labName?.n || r.lab_id,
+            lab?.name || r.lab_id,
             label,
             r.student_name,
             r.student_id,

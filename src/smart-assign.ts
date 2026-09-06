@@ -102,6 +102,10 @@ export function parseSmartConstraint(raw: string): SmartConstraint {
  * 依约束产出落座顺序（最终与"未加任何约束时"无差异的输入恒等）。
  * 返回排好序的 students 副本；学生姓名重复时按"名单首次出现"匹配。
  */
+/**
+ * 依约束产出落座顺序。返回排好序的 students 副本；姓名重复时按"名单首次出现"匹配。
+ * pairs 用并查集把要邻座的学生聚成组块，组内连续 → 落座时相邻（可能跨行尾，仍相邻）。
+ */
 export function orderStudentsForSeats(
   students: StudentRow[],
   constraint: SmartConstraint,
@@ -115,23 +119,57 @@ export function orderStudentsForSeats(
   const preferIds = new Set(toIds(constraint.preferFront));
   const avoidIds = new Set(toIds(constraint.avoidFront));
 
-  const prefer = students.filter(s => preferIds.has(s.id));
-  const avoid = students.filter(s => avoidIds.has(s.id));
-  const middle = students.filter(s => !preferIds.has(s.id) && !avoidIds.has(s.id));
+  // ── pairs → 邻座组（并查集） ──
+  const parent = new Map<string, string>();
+  const find = (x: string): string => {
+    let p = x;
+    while (parent.get(p) !== p) p = parent.get(p)!;
+    parent.set(x, p); // path compress
+    return p;
+  };
+  const union = (a: string, b: string) => {
+    const ra = find(a);
+    const rb = find(b);
+    if (ra !== rb) parent.set(rb, ra);
+  };
+  for (const s of students) parent.set(s.id, s.id);
+  for (const [na, nb] of constraint.pairs) {
+    const [ida, idb] = toIds([na, nb]);
+    if (ida && idb) union(ida, idb);
+  }
+  // 名字到成员的映射（同组保持 pairs 给序 + 名单序兜底）
+  const rootOf = (id: string) => find(id);
+  const groups = new Map<string, StudentRow[]>();
+  for (const s of students) {
+    const root = rootOf(s.id);
+    if (!groups.has(root)) groups.set(root, []);
+    groups.get(root)!.push(s);
+  }
+  // 组块：单个成员的组也作为一个块（保持其余原序稳定）
+  const blocks = [...groups.values()];
+  // 稳定性：按各组首个学生在名单中的原始下标排序
+  const idxOf = new Map<string, number>();
+  students.forEach((s, i) => idxOf.set(s.id, i));
+  blocks.sort((a, b) => idxOf.get(a[0].id)! - idxOf.get(b[0].id)!);
 
-  // 中间区按需打散：相邻学生来自同一 name 的少（这里 name 唯一故近似 no-op，保留扩展位）
+  const split = (set: Set<string>) => blocks.filter(b => set.has(b[0].id));
+  const prefer = split(preferIds);
+  const avoid = split(avoidIds);
+  const middle = blocks.filter(b => !preferIds.has(b[0].id) && !avoidIds.has(b[0].id));
+
+  // 中间区按需打散（保持组分散），无随机则保持名单序
   if (constraint.spread) {
-    // 简单抖动：保持 group 尽量分散（可用后续启发式增强）
     middle.sort(() => Math.random() - 0.5);
   }
 
-  // strategy=activity：把有 group 的放前面、无 group 的垫底（分组语义由调用方传入 group_id）
+  const flatten = (bs: StudentRow[][]) => bs.flat();
+  // strategy=activity：有 group 的组块前置（组内成员均带 group 才判定；否则垫底）
   if (constraint.strategy === 'activity') {
-    const grouped = middle.filter(s => s.group_id);
-    const ungrouped = middle.filter(s => !s.group_id);
-    return [...prefer, ...grouped, ...ungrouped, ...avoid];
+    const groupedBlocks = middle.filter(b => b.every(s => s.group_id));
+    const ungroupedBlocks = middle.filter(b => !b.every(s => s.group_id));
+    return [...flatten(prefer), ...flatten(groupedBlocks), ...flatten(ungroupedBlocks), ...flatten(avoid)];
   }
-  return [...prefer, ...middle, ...avoid];
+  return [...flatten(prefer), ...flatten(middle), ...flatten(avoid)];
 }
 
 /** 校验约束里的姓名是否都能对上名单（给出可读差役，便于日志/提示） */

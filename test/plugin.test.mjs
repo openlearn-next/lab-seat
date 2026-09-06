@@ -393,7 +393,7 @@ test('积分集成：积分服务缺失时签到仍成功', async () => {
   createHostSchema(db);
   db.exec(`
     INSERT INTO users (id, name, role) VALUES ('s-1', '张三', 'student');
-    INSERT INTO lessons (id, name, status) VALUES ('l-1', 'Test', 'live');
+    INSERT INTO lessons (id, name, status, timeline) VALUES ('l-1', 'Test', 'live', '{"class_ids":["c-1"]}');
     INSERT INTO classes (id, name) VALUES ('c-1', 'CS101');
     INSERT INTO class_students (class_id, student_id) VALUES ('c-1', 's-1');
     INSERT INTO computer_labs (id, room_number, rows, cols) VALUES ('lab-1', 'A101', 5, 8);
@@ -489,7 +489,7 @@ test('§3.1 多机房批量分配 + lesson_lab_map 登记', async () => {
     INSERT INTO users (id, name, role) VALUES
       ('s1', '张三', 'student'), ('s2', '李四', 'student'),
       ('s3', '王五', 'student'), ('s4', '赵六', 'student');
-    INSERT INTO lessons (id, name, status) VALUES ('l-1', 'Test', 'live');
+    INSERT INTO lessons (id, name, status, timeline) VALUES ('l-1', 'Test', 'live', '{"class_ids":["c-1"]}');
     INSERT INTO classes (id) VALUES ('c-1');
     INSERT INTO class_students (class_id, student_id) VALUES
       ('c-1', 's1'), ('c-1', 's2'), ('c-1', 's3'), ('c-1', 's4');
@@ -537,7 +537,7 @@ test('§3.1 容量不足时抛出明确错误', async () => {
   db.exec(`
     INSERT INTO users (id, name, role) VALUES
       ('s1', '张三', 'student'), ('s2', '李四', 'student'), ('s3', '王五', 'student');
-    INSERT INTO lessons (id, name, status) VALUES ('l-1', 'Test', 'live');
+    INSERT INTO lessons (id, name, status, timeline) VALUES ('l-1', 'Test', 'live', '{"class_ids":["c-1"]}');
     INSERT INTO classes (id) VALUES ('c-1');
     INSERT INTO class_students (class_id, student_id) VALUES
       ('c-1', 's1'), ('c-1', 's2'), ('c-1', 's3');
@@ -563,7 +563,7 @@ test('§3.2 自动判定：超时未签到标记请假 + 迟到升级缺勤', as
   db.exec(`
     INSERT INTO users (id, name, role) VALUES
       ('s1', '张三', 'student'), ('s2', '李四', 'student'), ('s3', '王五', 'student');
-    INSERT INTO lessons (id, name, status) VALUES ('l-1', 'Test', 'live');
+    INSERT INTO lessons (id, name, status, timeline) VALUES ('l-1', 'Test', 'live', '{"class_ids":["c-1"]}');
     INSERT INTO classes (id) VALUES ('c-1');
     INSERT INTO class_students (class_id, student_id) VALUES
       ('c-1', 's1'), ('c-1', 's2'), ('c-1', 's3');
@@ -616,7 +616,7 @@ test('§2.5 unassign_student 移除单个学生座位', async () => {
   createHostSchema(db);
   db.exec(`
     INSERT INTO users (id, name, role) VALUES ('s1', '张三', 'student'), ('s2', '李四', 'student');
-    INSERT INTO lessons (id, name, status) VALUES ('l-1', 'Test', 'live');
+    INSERT INTO lessons (id, name, status, timeline) VALUES ('l-1', 'Test', 'live', '{"class_ids":["c-1"]}');
     INSERT INTO classes (id) VALUES ('c-1');
     INSERT INTO class_students (class_id, student_id) VALUES ('c-1', 's1'), ('c-1', 's2');
     INSERT INTO computer_labs (id, room_number, rows, cols) VALUES ('lab-A', 'A101', 2, 2);
@@ -651,7 +651,7 @@ test('P1 错误 code：无分配学生签到被拒 / 非本课节学生防刷', 
   db.exec(`
     INSERT INTO users (id, name, role) VALUES
       ('s1', '张小明', 'student'), ('s-x', '外部学生', 'student');
-    INSERT INTO lessons (id, name, status) VALUES ('l-1', 'Test', 'live');
+    INSERT INTO lessons (id, name, status, timeline) VALUES ('l-1', 'Test', 'live', '{"class_ids":["c-1"]}');
     INSERT INTO classes (id) VALUES ('c-1');
     INSERT INTO class_students (class_id, student_id) VALUES ('c-1', 's1');
     INSERT INTO computer_labs (id, room_number, rows, cols) VALUES ('lab-A', 'A101', 2, 2);
@@ -683,13 +683,37 @@ test('P1 错误 code：无分配学生签到被拒 / 非本课节学生防刷', 
   assert.equal(r2.message, '已签到', '重复签到返回幂等提示');
 });
 
+test('R1 多班隔离：课节只含 timeline 中的班级，不跨班串生', async () => {
+  createHostSchema(db);
+  db.exec(`
+    INSERT INTO users (id, name, role) VALUES
+      ('a1', 'A班生', 'student'), ('b1', 'B班生', 'student');
+    INSERT INTO lessons (id, name, status, timeline) VALUES ('l-1', 'Test', 'live', '{"class_ids":["class-A"]}');
+    INSERT INTO classes (id) VALUES ('class-A'), ('class-B');
+    INSERT INTO class_students (class_id, student_id) VALUES
+      ('class-A', 'a1'), ('class-B', 'b1');
+    INSERT INTO computer_labs (id, room_number, rows, cols) VALUES ('lab-A', 'A101', 2, 2);
+  `);
+  ctx = createMockContext(db);
+  mock = ctx.__test__;
+  await plugin.activate(ctx);
+
+  const assign = mock.commandHandlers.get('lab_seat.assign_seats');
+  const res = await assign.execute({ type: 'lab_seat.assign_seats', actorId: 't-1', payload: { lessonId: 'l-1', labId: 'lab-A', strategy: 'sequential' } });
+  assert.ok(res.message.includes('1'), '只应分配 A 班 1 名学生');
+
+  const assigned = db.prepare(`SELECT student_id FROM plugin_lab_seat_seat_assignments WHERE lesson_id = 'l-1'`).all();
+  assert.equal(assigned.length, 1);
+  assert.equal(assigned[0].student_id, 'a1', '不应包含 B 班学生');
+});
+
 test('§3.3 attendance_trend 按课节返回到课率时间序列', async () => {
   createHostSchema(db);
   db.exec(`
     INSERT INTO users (id, name, role) VALUES
       ('s1', '张三', 'student'), ('s2', '李四', 'student'), ('s3', '王五', 'student');
-    INSERT INTO lessons (id, name, status) VALUES
-      ('l-old', '上周课', 'ended'), ('l-new', '今日课', 'live');
+    INSERT INTO lessons (id, name, status, timeline) VALUES
+      ('l-old', '上周课', 'ended', '{"class_ids":["c-1"]}'), ('l-new', '今日课', 'live', '{"class_ids":["c-1"]}');
     INSERT INTO classes (id) VALUES ('c-1');
     INSERT INTO class_students (class_id, student_id) VALUES
       ('c-1', 's1'), ('c-1', 's2'), ('c-1', 's3');
@@ -732,7 +756,7 @@ test('§3.4 grouped 分配经 getResearchGroups + 活动座位 map', async () =>
     INSERT INTO users (id, name, role) VALUES
       ('s1', '张三', 'student'), ('s2', '李四', 'student'),
       ('s3', '王五', 'student'), ('s4', '赵六', 'student');
-    INSERT INTO lessons (id, name, status) VALUES ('l-1', 'Test', 'live');
+    INSERT INTO lessons (id, name, status, timeline) VALUES ('l-1', 'Test', 'live', '{"class_ids":["c-1"]}');
     INSERT INTO classes (id) VALUES ('c-1');
     INSERT INTO class_students (class_id, student_id) VALUES
       ('c-1', 's1'), ('c-1', 's2'), ('c-1', 's3'), ('c-1', 's4');
@@ -778,7 +802,7 @@ test('§3.4 plugin_research_groups 表缺失时 grouped 分配不崩且成员落
   db.exec(`
     INSERT INTO users (id, name, role) VALUES
       ('s1', '张三', 'student'), ('s2', '李四', 'student');
-    INSERT INTO lessons (id, name, status) VALUES ('l-1', 'Test', 'live');
+    INSERT INTO lessons (id, name, status, timeline) VALUES ('l-1', 'Test', 'live', '{"class_ids":["c-1"]}');
     INSERT INTO classes (id) VALUES ('c-1');
     INSERT INTO class_students (class_id, student_id) VALUES ('c-1', 's1'), ('c-1', 's2');
     INSERT INTO computer_labs (id, room_number, rows, cols) VALUES ('lab-A', 'A101', 2, 2);
@@ -805,7 +829,7 @@ test('exports 提供且可解析（带 & 等特殊字符的姓名）', async () 
       ('s-quote', '李"四', 'student'),
       ('s-newline', '王\n五', 'student'),
       ('s-normal', '赵六', 'student');
-    INSERT INTO lessons (id, name, status) VALUES ('l-1', 'Test', 'live');
+    INSERT INTO lessons (id, name, status, timeline) VALUES ('l-1', 'Test', 'live', '{"class_ids":["c-1"]}');
     INSERT INTO classes (id) VALUES ('c-1');
     INSERT INTO class_students (class_id, student_id) VALUES
       ('c-1', 's-comma'), ('c-1', 's-quote'), ('c-1', 's-newline'), ('c-1', 's-normal');
@@ -845,7 +869,7 @@ test('§4.2 smart_assign_seats：AI 约束落座', async () => {
     INSERT INTO users (id, name, role) VALUES
       ('s1', '张小明', 'student'), ('s2', '李雷', 'student'),
       ('s3', '韩梅梅', 'student'), ('s4', '王芳', 'student'), ('s5', '赵六', 'student');
-    INSERT INTO lessons (id, name, status) VALUES ('l-1', 'Test', 'live');
+    INSERT INTO lessons (id, name, status, timeline) VALUES ('l-1', 'Test', 'live', '{"class_ids":["c-1"]}');
     INSERT INTO classes (id) VALUES ('c-1');
     INSERT INTO class_students (class_id, student_id) VALUES
       ('c-1', 's1'), ('c-1', 's2'), ('c-1', 's3'), ('c-1', 's4'), ('c-1', 's5');
@@ -878,7 +902,7 @@ test('§4.2 smart_assign_seats：AI 服务不可用时报明确错误', async ()
   createHostSchema(db);
   db.exec(`
     INSERT INTO users (id, name, role) VALUES ('s1', '张小明', 'student');
-    INSERT INTO lessons (id, name, status) VALUES ('l-1', 'Test', 'live');
+    INSERT INTO lessons (id, name, status, timeline) VALUES ('l-1', 'Test', 'live', '{"class_ids":["c-1"]}');
     INSERT INTO classes (id) VALUES ('c-1');
     INSERT INTO class_students (class_id, student_id) VALUES ('c-1', 's1');
     INSERT INTO computer_labs (id, room_number, rows, cols) VALUES ('lab-A', 'A101', 1, 1);
@@ -901,7 +925,7 @@ test('§4.2 smart_assign_seats：非法 AI 输出回退空约束仍能分配', a
   createHostSchema(db);
   db.exec(`
     INSERT INTO users (id, name, role) VALUES ('s1', '张小明', 'student'), ('s2', '李雷', 'student');
-    INSERT INTO lessons (id, name, status) VALUES ('l-1', 'Test', 'live');
+    INSERT INTO lessons (id, name, status, timeline) VALUES ('l-1', 'Test', 'live', '{"class_ids":["c-1"]}');
     INSERT INTO classes (id) VALUES ('c-1');
     INSERT INTO class_students (class_id, student_id) VALUES ('c-1', 's1'), ('c-1', 's2');
     INSERT INTO computer_labs (id, room_number, rows, cols) VALUES ('lab-A', 'A101', 1, 2);

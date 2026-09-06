@@ -4,6 +4,19 @@ All notable changes to the **机房座位管理（Lab Seat Management）Plugin**
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.6.2] - 2026-09-06
+
+### Fixed（审计 C1-C4 + R1/R6 修复）
+- **C1 课堂浮动面板重订阅风暴**：LabSeatToolPanel 的 `load` 原为每次 render 重建且被放进订阅 effect 依赖 → 每 render 清旧订阅+重建+立即 tick，面板可见期间无限拉取。改为 `useCallback([])` 稳定引用 + 订阅只依赖 `[visible]`，并去重打开时重复 load。
+- **C2 老用户升级缺表缺索引**：host 的 migrate 仅在版本递增时执行回调，而历史各版全把 DDL 塞在 `migrate(1)`——已部署用户（migration=1）升级后 0.4.0 的 `lesson_room_map` 表与 0.6.1 的查询索引永不建立。拆出 **`migrate(2)`** 承载这些幂等 DDL，升级自动补齐。
+- **C3 学生端视图在纯轮询下失活**：StudentSeatView 的订阅 handler 用 `event?.payload?.lessonId && session && …` 过滤——轮询 event 恒 undefined、初始 session=null 时 socket 事件也被短路 → 卡在"当前无签到活动"。改为无条件 `load()`（服务端按 actor 返回，自洽；退避防抖），并补会话结束时的旧座位/布局清理。
+- **C4 smart_assign 的 pairs（强制邻座）解析了却不实现**：orderStudentsForSeats 现用并查集把配对学生聚成组块连续落座（支持链式 A-B-C 三连坐、与 preferFront 并存、不存在姓名忽略）。
+- **R1 学生查询跨班串生**：getStudentsByLesson 原 fallback 用 `JOIN classes c ON 1=1`（笛卡尔积）会拉进别班学生；改为从 timeline 安全解析 class_ids（兼容对象/字符串两种形态），解析失败返回空（宁缺毋错），并新增多班隔离回归测试。
+- **R6 导出 N+1**：export_attendance 每行 2 次机房查询 → 预取 lab 缓存一次查完。
+
+### Tests
+- 测试 harness 的 lessons 现带 `timeline.class_ids`，真实主查询路径（非 fallback）被覆盖；新增多班隔离、pairs 邻座×4、smart 17 例。总计 54 断言 + E2E 全绿。
+
 ## [0.6.1] - 2026-09-06
 
 ### Added

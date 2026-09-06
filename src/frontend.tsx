@@ -1246,19 +1246,27 @@ function StudentSeatView(props: { studentId?: string }) {
         const room = await invoke<any>('lab_seat.get_room', { roomId: result.seat.lab_id });
         if (room) setLayout(JSON.parse(room.layout_json));
       }
+    } else {
+      // 无活跃会话时清掉旧座位/布局，避免下轮开签闪残留
+      setSeat(null);
+      setAttendance(null);
+      setLayout(null);
+      setMsg('');
     }
   }, [studentId]);
 
   useEffect(() => { load(); }, [load]);
 
+  // 会话开始/结束/重排时刷新。无条件 load()：
+  // 轮询路径的 event 恒 undefined，事件路径 session 可能尚为 null——两者都需
+  // 触发查询（服务端按 actor 返回当前活跃会话，天然自洽）。
+  // 频繁触发由 subscribeToEvents 的 in-flight 保护 + 退避吸收（C3）。
   useEffect(() => {
     return subscribeToEvents(
       ['lab_seat.check_in_opened', 'lab_seat.attendance_closed', 'lab_seat.seats_assigned'],
-      (event: any) => {
-        if (event?.payload?.lessonId && session && event.payload.lessonId === session.lesson_id) load();
-      },
+      () => { load(); },
     );
-  }, [session, load]);
+  }, [load]);
 
   const handleCheckIn = async () => {
     if (!session) return;
@@ -1338,7 +1346,9 @@ function LabSeatToolPanel() {
   const [rooms, setRooms] = useState<any[]>([]);
   const [selectedLabId, setSelectedLabId] = useState('');
 
-  const load = async () => {
+  // load 稳定引用（useCallback 空依赖）：内部只用 setState/函数式更新，
+  // 避免每次 render 重建 → 订阅 effect 重跑 → 立即 tick 的订阅风暴（C1）
+  const load = useCallback(async () => {
     const s = await invoke<any>('lab_seat.get_current_lesson_attendance');
     setSummary(s);
     const active = await invoke<any>('lab_seat.get_active_check_in', {});
@@ -1351,20 +1361,24 @@ function LabSeatToolPanel() {
       if (prev && roomList.some(rm => rm.id === prev)) return prev;
       return roomList[0]?.id || '';
     });
-  };
+  }, []);
 
   useEffect(() => {
     if (visible) load();
-  }, [visible]);
+  }, [visible, load]);
 
   useEffect(() => {
+    if (!visible) return;
     return subscribeToEvents(
       ['lab_seat.student_checked_in', 'lab_seat.check_in_opened'],
-      () => { if (visible) load(); },
+      () => { load(); },
     );
   }, [visible, load]);
 
-  const toggle = () => { setVisible(!visible); if (!visible) load(); };
+  const toggle = () => {
+    if (!visible) load(); // 打开前先拉一次
+    setVisible(!visible);
+  };
 
   const panel = visible ? (
     <div style={{
