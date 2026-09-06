@@ -4,7 +4,10 @@ import {
   IActionRegistryServiceToken,
   IEventBusServiceToken,
   IDatabaseToken,
+  IPointsLedgerServiceToken,
+  Token,
 } from '@openlearn/plugin-sdk';
+import { escapeCsvField, csvRow } from './csv.js';
 
 // ── Types ──────────────────────────────────────────────
 interface LabRoom {
@@ -37,20 +40,40 @@ type CheckInStatus = 'checked_in' | 'late' | 'leave' | 'absent';
 type SessionStatus = 'closed' | 'open' | 'ended';
 type AssignStrategy = 'sequential' | 'random' | 'grouped';
 
+// 跨插件服务 Token：供其他插件消费 ILabSeatService。
+// 用 SDK 的 Token<T> 强类型，标识符使用插件全限定命名空间。
+const ILabSeatServiceToken = new Token<ILabSeatService>('@aymwoo/plugin-lab-seat:ILabSeatService');
+
+interface ILabSeatService {
+  getStudentSeat(lessonId: string, studentId: string): Promise<unknown>;
+  getAttendanceStatus(lessonId: string, studentId: string): Promise<unknown>;
+  getLessonAttendanceSummary(lessonId: string): Promise<Record<string, number>>;
+}
+
+// CSV 字段转义：RFC 4180。实现见 src/csv.ts；通过顶层 import 引入。
+// 同时供 test/csv.test.mjs 独立验证。
+
 // ── Plugin ──────────────────────────────────────────────
 export default {
   manifest: {
     id: '@aymwoo/plugin-lab-seat',
     name: '机房座位管理',
-    version: '0.2.0',
+    version: '0.4.0',
     description: '统一机房座位管理 - 教师编排布局分配座位，学生查看座位并签到',
     author: 'aymwoo',
+    main: 'index.js',
     engines: { openlearn: '>= 0.1.0' },
     requires: [
       '@openlearn/core:ICommandBusService@^1.0.0',
       '@openlearn/core:IActionRegistryService@^1.0.0',
       '@openlearn/core:IEventBusService@^1.0.0',
       '@openlearn/core:IDatabase@^1.0.0',
+    ],
+    optional: [
+      '@openlearn/core:IPointsLedgerService@^1.0.0', // 积分服务可选，缺失则静默跳过
+    ],
+    provides: [
+      '@aymwoo/plugin-lab-seat:ILabSeatService',
     ],
     capabilitiesProposed: [
       'lab_seat:read',
@@ -61,6 +84,10 @@ export default {
       'class:read',
       'student:read',
     ],
+    updateSource: {
+      type: 'github-release',
+      repo: 'aymwoo/OpenLearn-Next-V2',
+    },
     configuration: {
       properties: {
         points_per_check_in: {
@@ -89,12 +116,25 @@ export default {
     const rawDb: any = await ctx.resolve(IDatabaseToken);
 
    // ── 1. 数据库迁移 ─────────────────────────────────
-   // 机房数据复用平台 computer_labs 表，补缺失列（幂等）
+   // 机房数据复用平台 computer_labs 表。若表本身不存在则创建（fresh install），
+   // 若存在则补缺失列（幂等 ALTER TABLE）。
+   rawDb.exec(`
+     CREATE TABLE IF NOT EXISTS computer_labs (
+       id TEXT PRIMARY KEY,
+       room_number TEXT NOT NULL,
+       name TEXT DEFAULT '',
+       rows INTEGER DEFAULT 5,
+       cols INTEGER DEFAULT 8,
+       layout_json TEXT DEFAULT '{}',
+       created_at INTEGER DEFAULT 0,
+       updated_at INTEGER DEFAULT 0
+     );
+   `);
    try { rawDb.prepare("ALTER TABLE computer_labs ADD COLUMN name TEXT DEFAULT ''").run(); } catch {}
    try { rawDb.prepare("ALTER TABLE computer_labs ADD COLUMN layout_json TEXT DEFAULT '{}'").run(); } catch {}
    try { rawDb.prepare('ALTER TABLE computer_labs ADD COLUMN updated_at INTEGER DEFAULT 0').run(); } catch {}
-   // 存量数据：将 room_number 填充到 name
-   rawDb.prepare("UPDATE computer_labs SET name = room_number WHERE name IS NULL OR name = ''").run();
+   // 存量数据：将 room_number 填充到 name（fresh install 时表刚创建，无数据，静默跳过）
+   try { rawDb.prepare("UPDATE computer_labs SET name = room_number WHERE name IS NULL OR name = ''").run(); } catch {}
 
    await ctx.db.migrate(1, async (sqliteDb: any) => {
      // 座位分配
@@ -145,6 +185,16 @@ export default {
          created_at INTEGER NOT NULL
        )
      `).run();
+     // 课节-机房关联表（v0.4.0 §3.1 多机房）：一个课节可关联多个机房，
+     // 每个机房独立分配/查看/考勤。兼容旧数据（未登记的在 list_lesson_labs 时自动补全）。
+     sqliteDb.prepare(`
+       CREATE TABLE IF NOT EXISTS ${ctx.db.table('lesson_room_map')} (
+         lesson_id TEXT NOT NULL,
+         lab_id TEXT NOT NULL,
+         created_at INTEGER NOT NULL,
+         PRIMARY KEY (lesson_id, lab_id)
+       )
+     `).run();
    });
 
     // ── 表名引用 ──────────────────────────────────────
@@ -160,11 +210,14 @@ export default {
     const T_ATTEND = ctx.db.table('attendance_records');
     const T_SESSIONS = ctx.db.table('check_in_sessions');
     const T_TEMPLATES = ctx.db.table('seat_templates');
+    const T_LESSON_ROOMS = ctx.db.table('lesson_room_map'); // §3.1 多机房
 
     // ── 辅助函数 ──────────────────────────────────────
     function uid(): string {
       return globalThis.crypto.randomUUID();
     }
+
+    // 注：escapeCsvField / csvRow 已在模块顶层 export，供 test/csv.test.mjs 独立验证。
 
     function getStudentsByLesson(lessonId: string): { id: string; name: string; student_id?: string }[] {
       const rows = rawDb.prepare(`
@@ -259,7 +312,7 @@ export default {
         const layout: LabLayout = { rows: p.rows, cols: p.cols, numbering: { scheme, direction: 'row-first' }, cells };
         const now = Date.now();
         rawDb.prepare(`INSERT INTO ${T_ROOMS} (id, room_number, name, rows, cols, layout_json, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(id, p.name, p.name, p.rows, p.cols, JSON.stringify(layout), now, now);
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(id, p.room_number, p.name || p.room_number, p.rows, p.cols, JSON.stringify(layout), now, now);
 
         await eventBus.publish({
           id: uid(), type: 'lab_seat.room_created', source: `plugin.${pluginId}`,
@@ -306,108 +359,176 @@ export default {
     await actionRegistry.register({
       id: 'lab_seat-auto-assign',
       commandType: 'lab_seat.assign_seats',
-      description: '为学生分配座位。按学号顺序、随机打散或按小组聚集。如"帮我把这节课的学生随机分配到 A101 机房"',
+      description: '为学生分配座位。可指定多个机房，按容量顺序填充。按学号顺序、随机打散或按小组聚集。如"把这节课的学生随机分配到 A101 和 A102 机房"',
       capabilityRequired: 'lab_seat:write',
       inputSchema: {
         type: 'OBJECT',
         properties: {
           lessonId: { type: 'STRING', description: '课节 ID' },
-          labId: { type: 'STRING', description: '机房 ID' },
+          labIds: { type: 'ARRAY', description: '机房 ID 列表（多机房，按容量顺序填充；与 labId 二选一）' },
+          labId: { type: 'STRING', description: '单个机房 ID（与 labIds 二选一，向后兼容）' },
           strategy: { type: 'STRING', description: '分配策略：sequential/random/grouped' },
           activityId: { type: 'STRING', description: '分组策略时的研究活动 ID' },
-          templateId: { type: 'STRING', description: '应用模板 ID（覆盖自动策略）' },
+          templateId: { type: 'STRING', description: '应用模板 ID（覆盖自动策略，仅限单机房模板）' },
         },
-        required: ['lessonId', 'labId'],
+        required: ['lessonId'],
       },
     });
 
     await commandBus.registerHandler('lab_seat.assign_seats', {
       async execute(command) {
         const p = command.payload as any;
-        const layout = getLabLayout(p.labId);
-        if (!layout) throw new Error('机房不存在');
-
-        let students = getStudentsByLesson(p.lessonId);
+        const students = getStudentsByLesson(p.lessonId);
         if (!students || students.length === 0) {
           throw new Error('未找到该课节的学生');
         }
 
-        // 如果指定了模板，直接用模板分配
+        // 模板只能应用在单个机房（模板绑定 lab_id）
         if (p.templateId) {
           const tmpl = rawDb.prepare(`SELECT * FROM ${T_TEMPLATES} WHERE id = ?`).get(p.templateId);
           if (!tmpl) throw new Error('模板不存在');
+          const labId = tmpl.lab_id;
+          if (!getLabLayout(labId)) throw new Error('模板机房不存在');
           const assignments = JSON.parse(tmpl.assignments_json);
-          const delStmt = rawDb.prepare(`DELETE FROM ${T_ASSIGN} WHERE lesson_id = ? AND lab_id = ?`).run();
+          const delStmt = rawDb.prepare(`DELETE FROM ${T_ASSIGN} WHERE lesson_id = ? AND lab_id = ?`);
           const insStmt = rawDb.prepare(`INSERT OR REPLACE INTO ${T_ASSIGN}
             (id, lesson_id, student_id, lab_id, row_idx, col_idx, group_id, assigned_strategy, assigned_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run();
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
           const now = Date.now();
-          delStmt.run(p.lessonId, p.labId);
+          delStmt.run(p.lessonId, labId);
           for (const a of assignments) {
-            insStmt.run(uid(), p.lessonId, a.student_id, p.labId, a.row_idx, a.col_idx, a.group_id || '', 'template', now);
+            insStmt.run(uid(), p.lessonId, a.student_id, labId, a.row_idx, a.col_idx, a.group_id || '', 'template', now);
           }
-        } else {
-          const strategy: AssignStrategy = p.strategy || 'random';
-          const seats = layout.cells.filter(c => c.type !== 'none');
-          const shuffled = [...seats];
-
-          if (strategy === 'random') {
-            for (let i = shuffled.length - 1; i > 0; i--) {
-              const j = Math.floor(Math.random() * (i + 1));
-              [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-            }
-            students = [...students];
-            for (let i = students.length - 1; i > 0; i--) {
-              const j = Math.floor(Math.random() * (i + 1));
-              [students[i], students[j]] = [students[j], students[i]];
-            }
-          } else if (strategy === 'grouped' && p.activityId) {
-            const groups = rawDb.prepare(
-              `SELECT * FROM plugin_research_groups WHERE activity_id = ?`
-            ).all(p.activityId);
-            const grouped: typeof students = [];
-            for (const g of groups) {
-              const memberIds: string[] = JSON.parse(g.member_ids);
-              for (const mid of memberIds) {
-                const s = students.find((s: any) => s.id === mid);
-                if (s) {
-                  (s as any).group_id = g.id;
-                  grouped.push(s);
-                }
-              }
-            }
-            // 未分组的学生追加到末尾
-            for (const s of students) {
-              if (!grouped.find((g: any) => g.id === s.id)) grouped.push(s);
-            }
-            students = grouped;
-          }
-          // sequential 保持原序
-
-          // 写入分配
-          const delStmt = rawDb.prepare(`DELETE FROM ${T_ASSIGN} WHERE lesson_id = ? AND lab_id = ?`).run();
-          const insStmt = rawDb.prepare(`INSERT OR REPLACE INTO ${T_ASSIGN}
-            (id, lesson_id, student_id, lab_id, row_idx, col_idx, group_id, assigned_strategy, assigned_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run();
-          const now = Date.now();
-          delStmt.run(p.lessonId, p.labId);
-          for (let i = 0; i < students.length && i < shuffled.length; i++) {
-            const s: any = students[i];
-            insStmt.run(uid(), p.lessonId, s.id, p.labId, shuffled[i].row, shuffled[i].col,
-              s.group_id || '', strategy, now);
-          }
+          upsertLessonRoom(p.lessonId, labId);
+          const count = rawDb.prepare(`SELECT COUNT(*) as cnt FROM ${T_ASSIGN} WHERE lesson_id = ? AND lab_id = ?`)
+            .get(p.lessonId, labId) as any;
+          await eventBus.publish({
+            id: uid(), type: 'lab_seat.seats_assigned', source: `plugin.${pluginId}`,
+            payload: { lessonId: p.lessonId, labId, count: count.cnt },
+            timestamp: Date.now(), correlationId: command.id,
+          });
+          return { message: `已为 ${count.cnt} 名学生分配座位` };
         }
 
+        // 解析目标机房集合：优先 labIds[]（多机房批量），回退单 labId
+        const labIds: string[] = Array.isArray(p.labIds) && p.labIds.length > 0
+          ? p.labIds
+          : (p.labId ? [p.labId] : []);
+        if (labIds.length === 0) throw new Error('未指定机房');
+        const layouts = labIds.map(id => {
+          const layout = getLabLayout(id);
+          if (!layout) throw new Error(`机房不存在: ${id}`);
+          return layout;
+        });
+        const totalSeats = layouts.reduce((sum, l) => sum + l.cells.filter(c => c.type !== 'none').length, 0);
+        if (students.length > totalSeats) {
+          throw new Error(`可用座位不足：需要 ${students.length}，仅 ${totalSeats} 个（可添加更多机房）`);
+        }
+
+        // 策略排序（仅对多机房有意义；单机房保持原行为）
+        const strategy: AssignStrategy = p.strategy || 'random';
+        let ordered: typeof students = [...students];
+        if (strategy === 'random') {
+          for (let i = ordered.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [ordered[i], ordered[j]] = [ordered[j], ordered[i]];
+          }
+        } else if (strategy === 'grouped' && p.activityId) {
+          const groups = rawDb.prepare(`SELECT * FROM plugin_research_groups WHERE activity_id = ?`).all(p.activityId);
+          const grouped: typeof students = [];
+          for (const g of groups as any[]) {
+            const memberIds: string[] = JSON.parse(g.member_ids);
+            for (const mid of memberIds) {
+              const s = ordered.find((s: any) => s.id === mid);
+              if (s) {
+                (s as any).group_id = g.id;
+                grouped.push(s);
+              }
+            }
+          }
+          for (const s of ordered) if (!grouped.find((g: any) => g.id === s.id)) grouped.push(s);
+          ordered = grouped;
+        }
+        // sequential 保持原序
+
+        // 多机房：清除这些机房旧的分配（避免 UNIQUE(lesson_id,student_id) 冲突），再顺序填充
+        const now = Date.now();
+        const delStmt = rawDb.prepare(`DELETE FROM ${T_ASSIGN} WHERE lesson_id = ? AND lab_id = ?`);
+        const insStmt = rawDb.prepare(`INSERT OR REPLACE INTO ${T_ASSIGN}
+          (id, lesson_id, student_id, lab_id, row_idx, col_idx, group_id, assigned_strategy, assigned_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+        for (const lid of labIds) delStmt.run(p.lessonId, lid);
+
+        let cursor = 0;
+        for (let li = 0; li < labIds.length && cursor < ordered.length; li++) {
+          const lid = labIds[li];
+          const seats = layouts[li].cells.filter(c => c.type !== 'none');
+          for (const seat of seats) {
+            if (cursor >= ordered.length) break;
+            const s: any = ordered[cursor++];
+            insStmt.run(uid(), p.lessonId, s.id, lid, seat.row, seat.col, s.group_id || '', strategy, now);
+          }
+        }
+        // 预登记全部目标机房到 lesson_room_map（即使未实际落座，也让教师可在列表中切换查看）
+        for (const lid of labIds) upsertLessonRoom(p.lessonId, lid);
+
         const count = rawDb.prepare(
-          `SELECT COUNT(*) as cnt FROM ${T_ASSIGN} WHERE lesson_id = ? AND lab_id = ?`
-        ).get(p.lessonId, p.labId);
+          `SELECT COUNT(*) as cnt FROM ${T_ASSIGN} WHERE lesson_id = ? AND lab_id IN (${labIds.map(() => '?').join(',')})`
+        ).get(p.lessonId, ...labIds) as any;
 
         await eventBus.publish({
           id: uid(), type: 'lab_seat.seats_assigned', source: `plugin.${pluginId}`,
-          payload: { lessonId: p.lessonId, labId: p.labId, count: (count as any).cnt },
+          payload: { lessonId: p.lessonId, labId: labIds.length === 1 ? labIds[0] : null, labIds, count: count.cnt },
           timestamp: Date.now(), correlationId: command.id,
         });
-        return { message: `已为 ${(count as any).cnt} 名学生分配座位` };
+        return { message: `已为 ${count.cnt} 名学生分配座位（${labIds.length} 个机房）` };
+      },
+    });
+
+    // §3.1 辅助：登记课节-机房关联（幂等 upsert）
+    function upsertLessonRoom(lessonId: string, labId: string): void {
+      rawDb.prepare(
+        `INSERT OR IGNORE INTO ${T_LESSON_ROOMS} (lesson_id, lab_id, created_at) VALUES (?, ?, ?)`
+      ).run(lessonId, labId, Date.now());
+    }
+
+    // §3.1 查询课节已关联 / 已分配机房列表（含已分配人数）
+    await commandBus.registerHandler('lab_seat.list_lesson_labs', {
+      async execute(command) {
+        const p = command.payload as any;
+        // 从 map + assignments 两处合并，兼容旧数据（只有 assignment 没有 map 行）
+        const rows = rawDb.prepare(`
+          SELECT cl.id, cl.room_number, cl.name, cl.rows, cl.cols, cl.layout_json,
+            COALESCE(NULLIF(cl.name, ''), cl.room_number) AS display_name,
+            (SELECT COUNT(*) FROM ${T_ASSIGN} sa WHERE sa.lesson_id = ? AND sa.lab_id = cl.id) AS assigned_count
+          FROM ${T_ROOMS} cl
+          WHERE cl.id IN (
+            SELECT lab_id FROM ${T_LESSON_ROOMS} WHERE lesson_id = ?
+            UNION
+            SELECT lab_id FROM ${T_ASSIGN} WHERE lesson_id = ?
+          )
+          ORDER BY assigned_count DESC
+        `).all(p.lessonId, p.lessonId, p.lessonId);
+        return rows;
+      },
+    });
+
+    // §3.1 手动把一个机房关联到课节
+    await commandBus.registerHandler('lab_seat.add_lesson_lab', {
+      async execute(command) {
+        const p = command.payload as any;
+        upsertLessonRoom(p.lessonId, p.labId);
+        return { ok: true };
+      },
+    });
+
+    // §3.1 解除课节-机房关联（同时清除该机房内该课节的分配）
+    await commandBus.registerHandler('lab_seat.remove_lesson_lab', {
+      async execute(command) {
+        const p = command.payload as any;
+        rawDb.prepare(`DELETE FROM ${T_LESSON_ROOMS} WHERE lesson_id = ? AND lab_id = ?`).run(p.lessonId, p.labId);
+        rawDb.prepare(`DELETE FROM ${T_ASSIGN} WHERE lesson_id = ? AND lab_id = ?`).run(p.lessonId, p.labId);
+        return { ok: true };
       },
     });
 
@@ -426,13 +547,16 @@ export default {
     await commandBus.registerHandler('lab_seat.get_assignments', {
       async execute(command) {
         const p = command.payload as any;
+        // labId 可选：多机房课节按机房过滤，单机房课节传空则返回全部
+        const labFilter = p.labId ? `AND sa.lab_id = ?` : '';
+        const params = p.labId ? [p.lessonId, p.labId] : [p.lessonId];
         return rawDb.prepare(`
           SELECT sa.*, u.name as student_name
           FROM ${T_ASSIGN} sa
           JOIN users u ON u.id = sa.student_id
-          WHERE sa.lesson_id = ?
-          ORDER BY sa.row_idx, sa.col_idx
-        `).all(p.lessonId);
+          WHERE sa.lesson_id = ? ${labFilter}
+          ORDER BY sa.lab_id, sa.row_idx, sa.col_idx
+        `).all(...params);
       },
     });
 
@@ -581,14 +705,16 @@ export default {
     await commandBus.registerHandler('lab_seat.get_attendance', {
       async execute(command) {
         const p = command.payload as any;
+        const labFilter = p.labId ? `AND sa.lab_id = ?` : '';
+        const params = p.labId ? [p.lessonId, p.labId] : [p.lessonId];
         const records = rawDb.prepare(`
-          SELECT a.*, u.name as student_name, sa.row_idx, sa.col_idx
+          SELECT a.*, u.name as student_name, sa.row_idx, sa.col_idx, sa.lab_id
           FROM ${T_ASSIGN} sa
           LEFT JOIN ${T_ATTEND} a ON a.lesson_id = sa.lesson_id AND a.student_id = sa.student_id
           JOIN users u ON u.id = sa.student_id
-          WHERE sa.lesson_id = ?
-          ORDER BY sa.row_idx, sa.col_idx
-        `).all(p.lessonId);
+          WHERE sa.lesson_id = ? ${labFilter}
+          ORDER BY sa.lab_id, sa.row_idx, sa.col_idx
+        `).all(...params);
 
         const summary = { checked_in: 0, late: 0, leave: 0, absent: 0, total: (records as any[]).length };
         for (const r of records as any[]) {
@@ -616,6 +742,60 @@ export default {
       },
     });
 
+    // 动态探测 lessons 表字段：不同 host 版本可能有 name/title、status、started_at 等。
+    // 只 SELECT 实际存在的列，避免 host schema 演进后插件崩溃。
+    function getLessonColumnNames(): string[] {
+      try {
+        const cols = rawDb.prepare(`PRAGMA table_info(lessons)`).all() as Array<{ name: string }>;
+        return cols.map(c => c.name);
+      } catch {
+        return [];
+      }
+    }
+
+    // 查询教师当前活跃 / 最近的 lessons，供前端选择器使用。
+    // 优先级：status IN ('live','active') > 最近 started_at > 最近 created_at
+    function listLessons(limit: number): any[] {
+      const cols = getLessonColumnNames();
+      if (cols.length === 0 || !cols.includes('id')) return [];
+      const wanted = ['id', 'name', 'title', 'status', 'started_at', 'ended_at', 'created_at', 'updated_at', 'teacher_id']
+        .filter(c => cols.includes(c));
+      const selectClause = wanted.join(', ');
+      const orderClauses: string[] = [];
+      if (cols.includes('status')) orderClauses.push(`CASE WHEN status IN ('live','active') THEN 0 ELSE 1 END`);
+      if (cols.includes('started_at')) orderClauses.push(`started_at DESC`);
+      if (cols.includes('created_at')) orderClauses.push(`created_at DESC`);
+      const orderBy = orderClauses.length > 0 ? `ORDER BY ${orderClauses.join(', ')}` : '';
+      try {
+        return rawDb.prepare(`SELECT ${selectClause} FROM lessons ${orderBy} LIMIT ?`).all(limit);
+      } catch {
+        return [];
+      }
+    }
+
+    // ── 6.5 课节元数据查询 ─────────────────────────────────
+
+    await actionRegistry.register({
+      id: 'lab_seat-list-lessons',
+      commandType: 'lab_seat.list_lessons',
+      description: '列出教师当前活跃或最近的课节，供座位分配 / 考勤看板 选择课节 ID 使用',
+      capabilityRequired: 'lesson:read',
+      inputSchema: {
+        type: 'OBJECT',
+        properties: {
+          limit: { type: 'NUMBER', description: '返回数量上限，默认 50' },
+        },
+      },
+    });
+
+    await commandBus.registerHandler('lab_seat.list_lessons', {
+      async execute(command) {
+        const p = command.payload as any;
+        const limit = Math.min(Math.max(p.limit || 50, 1), 200);
+        return listLessons(limit);
+      },
+    });
+
     // ── 7. 导出 ───────────────────────────────────────
 
     await actionRegistry.register({
@@ -636,32 +816,39 @@ export default {
     await commandBus.registerHandler('lab_seat.export_attendance', {
       async execute(command) {
         const p = command.payload as any;
+        const labFilter = p.labId ? `AND sa.lab_id = ?` : '';
+        const params = p.labId ? [p.lessonId, p.labId] : [p.lessonId];
         const records = rawDb.prepare(`
-          SELECT sa.row_idx, sa.col_idx, u.name as student_name, u.id as student_id,
+          SELECT sa.lab_id, sa.row_idx, sa.col_idx, u.name as student_name, u.id as student_id,
             COALESCE(a.status, 'absent') as status,
             a.checked_in_at, a.note
           FROM ${T_ASSIGN} sa
           JOIN users u ON u.id = sa.student_id
           LEFT JOIN ${T_ATTEND} a ON a.lesson_id = sa.lesson_id AND a.student_id = sa.student_id
-          WHERE sa.lesson_id = ?
-          ORDER BY sa.row_idx, sa.col_idx
-        `).all(p.lessonId);
+          WHERE sa.lesson_id = ? ${labFilter}
+          ORDER BY sa.lab_id, sa.row_idx, sa.col_idx
+        `).all(...params);
 
-        const lab = rawDb.prepare(`
-          SELECT cr.name FROM ${T_ASSIGN} sa
-          JOIN ${T_ROOMS} cr ON cr.id = sa.lab_id
-          WHERE sa.lesson_id = ? LIMIT 1
-        `).get(p.lessonId);
-
-        let csv = '\uFEFF座位编号,学生姓名,学号,签到状态,签到时间,备注\n';
+        // 表头同样过 escapeCsvField（当前都是英文+中文，不含特殊字符，但保持代码一致性）
+        let csv = '\uFEFF' + csvRow(['机房', '座位编号', '学生姓名', '学号', '签到状态', '签到时间', '备注']);
+        const statusMap: Record<string, string> = { checked_in: '已签到', late: '迟到', leave: '请假', absent: '未签到' };
         for (const r of records as any[]) {
           const layout = getLabLayout(r.lab_id);
           const label = layout?.cells?.find((c: SeatCell) => c.row === r.row_idx && c.col === r.col_idx)?.label || `${r.row_idx}-${r.col_idx}`;
+          const labName = rawDb.prepare(`SELECT COALESCE(NULLIF(name, ''), room_number) AS n FROM ${T_ROOMS} WHERE id = ?`).get(r.lab_id) as any;
           const time = r.checked_in_at ? new Date(r.checked_in_at).toISOString() : '';
-          const statusMap: Record<string, string> = { checked_in: '已签到', late: '迟到', leave: '请假', absent: '未签到' };
-          csv += `${label},${r.student_name},${r.student_id},${statusMap[r.status] || r.status},${time},${r.note || ''}\n`;
+          csv += csvRow([
+            labName?.n || r.lab_id,
+            label,
+            r.student_name,
+            r.student_id,
+            statusMap[r.status] || r.status,
+            time,
+            r.note || '',
+          ]);
         }
-        return { csv, filename: `attendance_${p.lessonId}.csv` };
+        const labSuffix = p.labId ? `_${p.labId}` : '';
+        return { csv, filename: `attendance_${p.lessonId}${labSuffix}.csv` };
       },
     });
 
@@ -753,11 +940,11 @@ export default {
         const points = getConfigValue('points_per_check_in') ?? 5;
         if (points <= 0) return;
         // 尝试调用积分服务
-        const pointsToken = { name: '@openlearn/core:IPointsLedgerService' };
+        // 使用 SDK 导出的强类型 Token；服务缺失时 ctx.resolve 抛 DI 错误，静默跳过。
         try {
-          const pointsService: any = await ctx.resolve(pointsToken as any);
-          if (pointsService && pointsService.addPoints) {
-            await pointsService.addPoints(event.payload.studentId, points, '机房签到');
+          const pointsService = await ctx.resolve(IPointsLedgerServiceToken);
+          if (pointsService && typeof (pointsService as any).addPoints === 'function') {
+            await (pointsService as any).addPoints(event.payload.studentId, points, '机房签到');
           }
         } catch {
           // 积分服务未安装，静默跳过
@@ -772,9 +959,9 @@ export default {
     // Worker runtime 不支持 provide，仅主进程生效
     if (typeof (ctx as any).provide === 'function') {
       await (ctx as any).provide(
-      { name: '@aymwoo/plugin-lab-seat:ILabSeatService' } as any,
-      {
-        async getStudentSeat(lessonId: string, studentId: string) {
+        ILabSeatServiceToken as any,
+        {
+          async getStudentSeat(lessonId: string, studentId: string) {
           return getStudentSeatForLesson(lessonId, studentId);
         },
         async getAttendanceStatus(lessonId: string, studentId: string) {
