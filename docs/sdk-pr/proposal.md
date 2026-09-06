@@ -141,3 +141,39 @@ ls -la dist/index.js   # 观察 ~7.4 MB
 grep -oE "require_[a-zA-Z0-9_]+" dist/index.js | sort | uniq -c | sort -rn | head
 #   → require_utils / require_semver / require_GenericWorker / require_body_parser ...
 ```
+
+---
+
+## 7. 应用结果（2026-09-06 已落地宿主仓库）
+
+补丁已实际 apply 到 `/home/wuxf/Develop/openlearnv2`（commit `68ee958`，
+branch `fix/sdk-stop-exporting-host-runtime-classes`），含两处修改：
+
+1. `packages/plugin-sdk/index.ts`：删除 7 个实现类的**值导出**，保留 type-only 导出。
+2. `packages/core/plugin-host/__tests__/sdk-compatibility.test.ts`：实现类改从
+   core 规范路径 import（Token/DI 常量仍从 SDK 取），使测试契约与新设计一致。
+
+### 实测数据
+
+| 指标 | 修复前 | 修复后 |
+|------|--------|--------|
+| SDK `dist/index.js` | 34 KB（顶层 import express/jszip/pino/semver/uuid） | **7.7 KB**（仅 uuid 顶层 import） |
+| 插件 `dist/index.js` | 7.4 MB | **0.20 MB**（-97%） |
+| 插件 zip | 7.8 MB | **0.42 MB** |
+| SDK/core 测试 | — | **155/155 green** |
+| lab-seat 单测/集成 | 48 | **48/48 green** |
+| lab-seat E2E | — | **通过** |
+
+### 复现步骤（未来迭代）
+
+```bash
+cd /home/wuxf/Develop/openlearnv2/packages/plugin-sdk
+node build.mjs                       # dist → 7.7 KB
+# 插件侧若用 workspace/本地 SDK，重新 npx openlearn-plugin-sdk build 即可拿到瘦身
+```
+
+### 注意（升级发布提醒）
+
+- 这是**破坏性 API 变更**（对依赖 `import { PluginDistributionManager } from '@openlearn/plugin-sdk'` 的外部插件）；
+  若担心兼容，可先发布为 minor + CHANGELOG 说明，或叠加方案 B（`/runtime` 子路径双入口）平滑过渡。
+- 已发布插件重装需用新 SDK 重新 build（旧 7.4 MB bundle 仍可用，只是偏大）。
