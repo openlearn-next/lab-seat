@@ -16,12 +16,22 @@ import plugin from '../tmp/plugin-test-bundle.mjs';
 
 // ── Test helpers ─────────────────────────────────────────────────────────
 
-function createMockContext(db) {
+function createMockContext(db, extraConfig) {
   const commandHandlers = new Map();
   const actionDescriptors = [];
   const publishedEvents = [];
   const providedServices = new Map();
   const resolvedTokens = new Map();
+
+  // 可选的运行配置覆盖（默认全 0 → 自动判定关闭）
+  const config = {
+    points_per_check_in: 5,
+    late_threshold_minutes: 10,
+    auto_mark_leave_after_minutes: 0,
+    late_auto_promote_after_minutes: 0,
+    auto_scan_interval_seconds: 60,
+    ...(extraConfig || {}),
+  };
 
   // Plugin ctx.db namespace —— 给 plugin 的命名空间表
   const ctx_db_table = (suffix) => `plugin_lab_seat_${suffix}`;
@@ -29,6 +39,7 @@ function createMockContext(db) {
   const ctx = {
     pluginId: '@aymwoo/plugin-lab-seat',
     manifest: plugin.manifest,
+    config,
 
     services: {
       commandBus: {
@@ -262,6 +273,7 @@ test('activate 注册所有 commands / actions', async () => {
     'lab_seat.get_room',
     'lab_seat.assign_seats',
     'lab_seat.move_student',
+    'lab_seat.unassign_student',
     'lab_seat.get_assignments',
     'lab_seat.open_check_in',
     'lab_seat.close_check_in',
@@ -271,11 +283,13 @@ test('activate 注册所有 commands / actions', async () => {
     'lab_seat.get_attendance',
     'lab_seat.get_my_seat',
     'lab_seat.export_attendance',
+    'lab_seat.attendance_trend',
     'lab_seat.shuffle_seats',
     'lab_seat.save_template',
     'lab_seat.list_templates',
     'lab_seat.get_current_lesson_attendance',
     'lab_seat.list_lessons',
+    'lab_seat.auto_mark_absent',
     'lab_seat.list_lesson_labs',
     'lab_seat.add_lesson_lab',
     'lab_seat.remove_lesson_lab',
@@ -534,6 +548,208 @@ test('§3.1 容量不足时抛出明确错误', async () => {
     /座位不足/,
     '容量不足时抛出明确错误',
   );
+});
+
+test('§3.2 自动判定：超时未签到标记请假 + 迟到升级缺勤', async () => {
+  createHostSchema(db);
+  db.exec(`
+    INSERT INTO users (id, name, role) VALUES
+      ('s1', '张三', 'student'), ('s2', '李四', 'student'), ('s3', '王五', 'student');
+    INSERT INTO lessons (id, name, status) VALUES ('l-1', 'Test', 'live');
+    INSERT INTO classes (id) VALUES ('c-1');
+    INSERT INTO class_students (class_id, student_id) VALUES
+      ('c-1', 's1'), ('c-1', 's2'), ('c-1', 's3');
+    INSERT INTO computer_labs (id, room_number, rows, cols) VALUES ('lab-A', 'A101', 2, 2);
+  `);
+  // 启用自动判定：1 分钟超时未签到 → leave；迟到 1 分钟 → absent
+  ctx = createMockContext(db, {
+    auto_mark_leave_after_minutes: 1,
+    late_auto_promote_after_minutes: 1,
+  });
+  mock = ctx.__test__;
+  await plugin.activate(ctx);
+
+  const assign = mock.commandHandlers.get('lab_seat.assign_seats');
+  await assign.execute({ type: 'lab_seat.assign_seats', actorId: 't-1', payload: { lessonId: 'l-1', labId: 'lab-A', strategy: 'sequential' } });
+
+  // 开启签到，并把 opened_at 拨到 13 分钟前：
+  //  - s2 现在签到 → late（>10min 阈值），且超出 promote 阈值（1min）→ 升级 absent
+  //  - s3 不签到 → 超 leave 阈值（1min）→ 标记请假
+  await mock.commandHandlers.get('lab_seat.open_check_in').execute({
+    type: 'lab_seat.open_check_in', actorId: 't-1', payload: { lessonId: 'l-1', labId: 'lab-A' },
+  });
+  const past = Date.now() - 13 * 60 * 1000;
+  db.prepare(`UPDATE plugin_lab_seat_check_in_sessions SET opened_at = ? WHERE lesson_id = 'l-1'`).run(past);
+
+  // s2 迟到签到，s3 干脆不签到
+  await mock.commandHandlers.get('lab_seat.check_in').execute({
+    type: 'lab_seat.check_in', actorId: 's2', payload: { lessonId: 'l-1' },
+  });
+
+  // 手动触发一次自动扫描（不等待 interval）
+  await mock.commandHandlers.get('lab_seat.auto_mark_absent').execute({
+    type: 'lab_seat.auto_mark_absent', actorId: 't-1', payload: {},
+  });
+
+  const att = (sid) => db.prepare(
+    `SELECT status FROM plugin_lab_seat_attendance_records WHERE lesson_id = 'l-1' AND student_id = ?`).get(sid);
+  // s2 签到被判 late，随后自动升级为 absent
+  const s2 = att('s2');
+  assert.equal(s2?.status, 'absent', `s2 迟到超时应升级缺勤，实际 ${s2?.status}`);
+  // s3 完全未签 → 自动标记 leave
+  const s3 = att('s3');
+  assert.equal(s3?.status, 'leave', `s3 应自动标记请假，实际 ${s3?.status}`);
+
+  // 清理后台 interval
+  await plugin.deactivate();
+});
+
+test('§2.5 unassign_student 移除单个学生座位', async () => {
+  createHostSchema(db);
+  db.exec(`
+    INSERT INTO users (id, name, role) VALUES ('s1', '张三', 'student'), ('s2', '李四', 'student');
+    INSERT INTO lessons (id, name, status) VALUES ('l-1', 'Test', 'live');
+    INSERT INTO classes (id) VALUES ('c-1');
+    INSERT INTO class_students (class_id, student_id) VALUES ('c-1', 's1'), ('c-1', 's2');
+    INSERT INTO computer_labs (id, room_number, rows, cols) VALUES ('lab-A', 'A101', 2, 2);
+  `);
+  ctx = createMockContext(db);
+  mock = ctx.__test__;
+  await plugin.activate(ctx);
+
+  const assign = mock.commandHandlers.get('lab_seat.assign_seats');
+  await assign.execute({ type: 'lab_seat.assign_seats', actorId: 't-1', payload: { lessonId: 'l-1', labId: 'lab-A', strategy: 'sequential' } });
+
+  const before = db.prepare(`SELECT COUNT(*) as c FROM plugin_lab_seat_seat_assignments WHERE lesson_id = 'l-1'`).get();
+  assert.equal(before.c, 2);
+
+  const move = mock.commandHandlers.get('lab_seat.move_student');
+  await move.execute({ type: 'lab_seat.move_student', actorId: 't-1', payload: { lessonId: 'l-1', studentId: 's1', rowIdx: 1, colIdx: 1 } });
+  const s1 = db.prepare(`SELECT row_idx, col_idx FROM plugin_lab_seat_seat_assignments WHERE lesson_id = 'l-1' AND student_id = 's1'`).get();
+  assert.deepEqual({ r: s1.row_idx, c: s1.col_idx }, { r: 1, c: 1 });
+
+  const unassign = mock.commandHandlers.get('lab_seat.unassign_student');
+  const removed = await unassign.execute({ type: 'lab_seat.unassign_student', actorId: 't-1', payload: { lessonId: 'l-1', studentId: 's2' } });
+  assert.equal(removed.removed, true);
+  const after = db.prepare(`SELECT COUNT(*) as c FROM plugin_lab_seat_seat_assignments WHERE lesson_id = 'l-1'`).get();
+  assert.equal(after.c, 1);
+
+  const again = await unassign.execute({ type: 'lab_seat.unassign_student', actorId: 't-1', payload: { lessonId: 'l-1', studentId: 's2' } });
+  assert.equal(again.removed, false);
+});
+
+test('§3.3 attendance_trend 按课节返回到课率时间序列', async () => {
+  createHostSchema(db);
+  db.exec(`
+    INSERT INTO users (id, name, role) VALUES
+      ('s1', '张三', 'student'), ('s2', '李四', 'student'), ('s3', '王五', 'student');
+    INSERT INTO lessons (id, name, status) VALUES
+      ('l-old', '上周课', 'ended'), ('l-new', '今日课', 'live');
+    INSERT INTO classes (id) VALUES ('c-1');
+    INSERT INTO class_students (class_id, student_id) VALUES
+      ('c-1', 's1'), ('c-1', 's2'), ('c-1', 's3');
+    INSERT INTO computer_labs (id, room_number, rows, cols) VALUES ('lab-A', 'A101', 2, 2);
+  `);
+  ctx = createMockContext(db);
+  mock = ctx.__test__;
+  await plugin.activate(ctx);
+
+  const assign = mock.commandHandlers.get('lab_seat.assign_seats');
+  await assign.execute({ type: 'lab_seat.assign_seats', actorId: 't-1', payload: { lessonId: 'l-old', labId: 'lab-A', strategy: 'sequential' } });
+  await assign.execute({ type: 'lab_seat.assign_seats', actorId: 't-1', payload: { lessonId: 'l-new', labId: 'lab-A', strategy: 'sequential' } });
+
+  const now = Date.now();
+  // 两个课节各有 3 人；开 l-new 签到，s1 签到；l-old 全部缺席
+  const insSession = db.prepare(`INSERT INTO plugin_lab_seat_check_in_sessions (id, lesson_id, lab_id, status, opened_at, closed_at) VALUES (?, ?, ?, 'ended', ?, ?)`);
+  insSession.run('sess-old', 'l-old', 'lab-A', now - 7 * 24 * 3600 * 1000, now - 7 * 24 * 3600 * 1000 + 3600 * 1000);
+  insSession.run('sess-new', 'l-new', 'lab-A', now, null);
+  const insAtt = db.prepare(`INSERT INTO plugin_lab_seat_attendance_records (id, lesson_id, student_id, status, checked_in_at, note) VALUES (?, 'l-new', 's1', 'checked_in', ?, '')`);
+  insAtt.run('att-1', now);
+
+  const trend = mock.commandHandlers.get('lab_seat.attendance_trend');
+  const res = await trend.execute({ type: 'lab_seat.attendance_trend', actorId: 't-1', payload: { sinceDays: 30 } });
+
+  assert.ok(res.series.length >= 2, `应至少返回 2 个课节，实际 ${res.series.length}`);
+  const newer = res.series.find((x) => x.lessonId === 'l-new');
+  const older = res.series.find((x) => x.lessonId === 'l-old');
+  assert.equal(newer.total, 3);
+  assert.equal(newer.checked_in, 1);
+  assert.equal(newer.present, 1);
+  assert.equal(older.present, 0);
+  assert.equal(older.absent, 3);
+  // 时间顺序：新在前
+  assert.ok(res.series[0].openedAt >= res.series[res.series.length - 1].openedAt, 'series 应按时间倒序');
+});
+
+test('§3.4 grouped 分配经 getResearchGroups + 活动座位 map', async () => {
+  createHostSchema(db);
+  db.exec(`
+    INSERT INTO users (id, name, role) VALUES
+      ('s1', '张三', 'student'), ('s2', '李四', 'student'),
+      ('s3', '王五', 'student'), ('s4', '赵六', 'student');
+    INSERT INTO lessons (id, name, status) VALUES ('l-1', 'Test', 'live');
+    INSERT INTO classes (id) VALUES ('c-1');
+    INSERT INTO class_students (class_id, student_id) VALUES
+      ('c-1', 's1'), ('c-1', 's2'), ('c-1', 's3'), ('c-1', 's4');
+    INSERT INTO computer_labs (id, room_number, rows, cols) VALUES ('lab-A', 'A101', 2, 2);
+    -- 研究活动：组 g1={s1,s2}, g2={s3,s4}
+    CREATE TABLE IF NOT EXISTS plugin_research_groups (
+      id TEXT PRIMARY KEY, activity_id TEXT NOT NULL, member_ids TEXT NOT NULL
+    );
+    INSERT INTO plugin_research_groups (id, activity_id, member_ids) VALUES
+      ('g1', 'act-1', '["s1","s2"]'),
+      ('g2', 'act-1', '["s3","s4"]');
+  `);
+  ctx = createMockContext(db);
+  mock = ctx.__test__;
+  await plugin.activate(ctx);
+
+  const assign = mock.commandHandlers.get('lab_seat.assign_seats');
+  const res = await assign.execute({
+    type: 'lab_seat.assign_seats', actorId: 't-1',
+    payload: { lessonId: 'l-1', labId: 'lab-A', strategy: 'grouped', activityId: 'act-1' },
+  });
+  assert.ok(res.message.includes('4'), '应分配全部 4 名学生');
+
+  // group_id 已写入
+  const gRows = db.prepare(`SELECT student_id, group_id FROM plugin_lab_seat_seat_assignments WHERE lesson_id = 'l-1'`).all();
+  const gmap = {};
+  gRows.forEach((r) => { gmap[r.student_id] = r.group_id; });
+  assert.equal(gmap['s1'], 'g1');
+  assert.equal(gmap['s3'], 'g2');
+
+  // ILabSeatService.getActivitySeatMap 返回学生 → 座位
+  const provided = [...mock.providedServices.values()].find(v => v && typeof v.getActivitySeatMap === 'function');
+  assert.ok(provided, 'ILabSeatService 应被 provide');
+  const seatMap = await provided.getActivitySeatMap('act-1');
+  assert.equal(Object.keys(seatMap).length, 4, '活动内 4 名学生都有座位');
+  assert.ok(seatMap['s1'].labId === 'lab-A');
+  assert.equal(typeof seatMap['s1'].rowIdx, 'number');
+});
+
+test('§3.4 plugin_research_groups 表缺失时 grouped 分配不崩且成员落到末尾', async () => {
+  createHostSchema(db);
+  // 故意不建 plugin_research_groups 表
+  db.exec(`
+    INSERT INTO users (id, name, role) VALUES
+      ('s1', '张三', 'student'), ('s2', '李四', 'student');
+    INSERT INTO lessons (id, name, status) VALUES ('l-1', 'Test', 'live');
+    INSERT INTO classes (id) VALUES ('c-1');
+    INSERT INTO class_students (class_id, student_id) VALUES ('c-1', 's1'), ('c-1', 's2');
+    INSERT INTO computer_labs (id, room_number, rows, cols) VALUES ('lab-A', 'A101', 2, 2);
+  `);
+  ctx = createMockContext(db);
+  mock = ctx.__test__;
+  await plugin.activate(ctx);
+
+  const assign = mock.commandHandlers.get('lab_seat.assign_seats');
+  await assert.doesNotReject(() => assign.execute({
+    type: 'lab_seat.assign_seats', actorId: 't-1',
+    payload: { lessonId: 'l-1', labId: 'lab-A', strategy: 'grouped', activityId: 'act-x' },
+  }), 'research_groups 表缺失时 grouped 分配不应崩溃');
+
+  const cnt = db.prepare(`SELECT COUNT(*) as c FROM plugin_lab_seat_seat_assignments WHERE lesson_id = 'l-1'`).get();
+  assert.equal(cnt.c, 2, '2 名学生仍应被分配');
 });
 
 test('exports 提供且可解析（带 & 等特殊字符的姓名）', async () => {

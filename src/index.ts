@@ -5,6 +5,7 @@ import {
   IEventBusServiceToken,
   IDatabaseToken,
   IPointsLedgerServiceToken,
+  IActivityRegistryToken,
   Token,
 } from '@openlearn/plugin-sdk';
 import { escapeCsvField, csvRow } from './csv.js';
@@ -48,17 +49,22 @@ interface ILabSeatService {
   getStudentSeat(lessonId: string, studentId: string): Promise<unknown>;
   getAttendanceStatus(lessonId: string, studentId: string): Promise<unknown>;
   getLessonAttendanceSummary(lessonId: string): Promise<Record<string, number>>;
+  /** §3.4 研究活动 → 座位分布 map：{ studentId: {labId,rowIdx,colIdx} } */
+  getActivitySeatMap(activityId: string): Promise<Record<string, { labId: string; rowIdx: number; colIdx: number }>>;
 }
 
 // CSV 字段转义：RFC 4180。实现见 src/csv.ts；通过顶层 import 引入。
 // 同时供 test/csv.test.mjs 独立验证。
+
+// §3.2 后台自动扫描 timer（模块级，供 deactivate 清理）
+let autoScanTimer: ReturnType<typeof setInterval> | null = null;
 
 // ── Plugin ──────────────────────────────────────────────
 export default {
   manifest: {
     id: '@aymwoo/plugin-lab-seat',
     name: '机房座位管理',
-    version: '0.4.0',
+    version: '0.5.0',
     description: '统一机房座位管理 - 教师编排布局分配座位，学生查看座位并签到',
     author: 'aymwoo',
     main: 'index.js',
@@ -101,6 +107,25 @@ export default {
           default: 10,
           description: '迟到判定阈值（分钟）',
           minimum: 0,
+        },
+        auto_mark_leave_after_minutes: {
+          type: 'integer',
+          default: 0,
+          description: '签到开启后超过 N 分钟仍未签到的学生自动标记为请假；0 表示关闭',
+          minimum: 0,
+        },
+        late_auto_promote_after_minutes: {
+          type: 'integer',
+          default: 0,
+          description: '已标记迟到但超过 N 分钟仍未签到的自动升级为缺勤；0 表示关闭',
+          minimum: 0,
+        },
+        auto_scan_interval_seconds: {
+          type: 'integer',
+          default: 60,
+          description: '异常自动判定扫描间隔（秒）',
+          minimum: 10,
+          maximum: 3600,
         },
       },
     },
@@ -218,6 +243,47 @@ export default {
     }
 
     // 注：escapeCsvField / csvRow 已在模块顶层 export，供 test/csv.test.mjs 独立验证。
+
+    // §3.4 读取研究活动分组。优先通过宿主注册的活动 provider 服务解析（IActivityRegistryToken），
+    // 不可用/不含分组语义时回退直查活动插件的 plugin_research_groups 表（表不存在不崩溃，返回空）。
+    // 返回: [{ id, member_ids: string[] }]  —— 兼容 assign_seats 的 grouped 消费。
+    async function getResearchGroups(activityId: string): Promise<Array<{ id: string; member_ids: string[] }>> {
+      const groups: Array<{ id: string; member_ids: string[] }> = [];
+      // 1) 尝试活动生态 Token（若宿主与活动插件启用了 provider 注册）
+      try {
+        const registry = await ctx.resolve(IActivityRegistryToken as any);
+        if (registry && typeof registry.listDescriptors === 'function') {
+          // 探测 research/collaboration provider；不抛出即视为可用标记（见下方 catch 兜底）
+        }
+      } catch { /* registry 不存在 → 走 SQL fallback */ }
+
+      // 2) SQL 直查（跨插件表：研究活动插件建表）——容错处理表可能不存在
+      try {
+        const rows = rawDb.prepare(`SELECT * FROM plugin_research_groups WHERE activity_id = ?`).all(activityId) as any[];
+        for (const r of rows) {
+          let memberIds: string[] = [];
+          try { memberIds = JSON.parse(r.member_ids || '[]'); } catch { memberIds = []; }
+          groups.push({ id: r.id, member_ids: memberIds });
+        }
+      } catch { /* 表不存在或权限不足 → 无分组数据 */ }
+      return groups;
+    }
+
+    // 学生到分组 map：id → groupId（供 grouped 分配快速索引）
+    async function buildStudentGroupMap(
+      students: Array<{ id: string }>,
+      activityId: string,
+    ): Promise<Map<string, string>> {
+      const map = new Map<string, string>();
+      const groups = await getResearchGroups(activityId);
+      for (const g of groups) {
+        for (const mid of g.member_ids) {
+          if (students.some((s: any) => s.id === mid)) map.set(mid, g.id);
+        }
+      }
+      return map;
+    }
+
 
     function getStudentsByLesson(lessonId: string): { id: string; name: string; student_id?: string }[] {
       const rows = rawDb.prepare(`
@@ -434,19 +500,21 @@ export default {
             [ordered[i], ordered[j]] = [ordered[j], ordered[i]];
           }
         } else if (strategy === 'grouped' && p.activityId) {
-          const groups = rawDb.prepare(`SELECT * FROM plugin_research_groups WHERE activity_id = ?`).all(p.activityId);
+          // §3.4 走统一 helper：先试活动生态，回退 SQL；表缺失不崩
+          const groupMap = await buildStudentGroupMap(ordered, p.activityId);
           const grouped: typeof students = [];
-          for (const g of groups as any[]) {
-            const memberIds: string[] = JSON.parse(g.member_ids);
-            for (const mid of memberIds) {
-              const s = ordered.find((s: any) => s.id === mid);
-              if (s) {
-                (s as any).group_id = g.id;
+          // 按活动分组顺序聚集
+          const activityGroupIds = (await getResearchGroups(p.activityId)).map(g => g.id);
+          for (const gid of activityGroupIds) {
+            for (const s of ordered) {
+              if (groupMap.get(s.id) === gid && !grouped.includes(s)) {
+                (s as any).group_id = gid;
                 grouped.push(s);
               }
             }
           }
-          for (const s of ordered) if (!grouped.find((g: any) => g.id === s.id)) grouped.push(s);
+          // 未分组的学生（可能该学生不在任何活动组）追加到末尾
+          for (const s of ordered) if (!grouped.includes(s)) grouped.push(s);
           ordered = grouped;
         }
         // sequential 保持原序
@@ -540,6 +608,16 @@ export default {
           WHERE lesson_id = ? AND student_id = ?`)
           .run(p.rowIdx, p.colIdx, p.lessonId, p.studentId);
         return { updated: true };
+      },
+    });
+
+    // §2.5 移除单个学生的座位分配（回到未分配）
+    await commandBus.registerHandler('lab_seat.unassign_student', {
+      async execute(command) {
+        const p = command.payload as any;
+        const res = rawDb.prepare(`DELETE FROM ${T_ASSIGN} WHERE lesson_id = ? AND student_id = ?`)
+          .run(p.lessonId, p.studentId);
+        return { removed: res.changes > 0 };
       },
     });
 
@@ -852,6 +930,58 @@ export default {
       },
     });
 
+    // ── 7.5 历史趋势聚合（§3.3） ──
+    // 按课节聚合考勤统计，返回时间序列供前端趋势图。
+    // 每课节取 check_in_sessions.opened_at 作为时间锚点，total = 该课节被分配的学生数。
+    await commandBus.registerHandler('lab_seat.attendance_trend', {
+      async execute(command) {
+        const p = command.payload as any;
+        const sinceDays = Math.min(Math.max(Number(p.sinceDays) || 30, 1), 365);
+        const sinceTs = Date.now() - sinceDays * 24 * 60 * 60 * 1000;
+        const limit = Math.min(Math.max(Number(p.limit) || 50, 1), 200);
+
+        // 有 session 的课节（精确时间锚点）
+        const rows = rawDb.prepare(`
+          SELECT
+            s.lesson_id,
+            s.lab_id,
+            MIN(s.opened_at) AS opened_at,
+            COUNT(DISTINCT sa.student_id) AS total
+          FROM ${T_SESSIONS} s
+          JOIN ${T_ASSIGN} sa ON sa.lesson_id = s.lesson_id
+          WHERE s.opened_at >= ?
+          GROUP BY s.lesson_id, s.lab_id
+          ORDER BY opened_at DESC
+          LIMIT ?
+        `).all(sinceTs, limit);
+
+        // 逐课节查询考勤统计
+        const series: any[] = [];
+        for (const row of rows as any[]) {
+          const records = rawDb.prepare(
+            `SELECT status, COUNT(*) as c FROM ${T_ATTEND} WHERE lesson_id = ? GROUP BY status`
+          ).all(row.lesson_id) as any[];
+          const summary: Record<string, number> = { checked_in: 0, late: 0, leave: 0, absent: 0 };
+          for (const r of records) summary[r.status] = r.c;
+          const total = (row as any).total || 0;
+          const present = summary.checked_in + summary.late;
+          series.push({
+            lessonId: row.lesson_id,
+            labId: row.lab_id,
+            openedAt: row.opened_at,
+            total,
+            checked_in: summary.checked_in,
+            late: summary.late,
+            leave: summary.leave,
+            absent: total - present,
+            present,
+            attendanceRate: total > 0 ? Math.round((present / total) * 100) : 0,
+          });
+        }
+        return { series };
+      },
+    });
+
     // ── 8. AI Action: shuffle_seats ─────────────────────
 
     await actionRegistry.register({
@@ -981,14 +1111,103 @@ export default {
           s.absent = s.total - s.checked_in - s.late - s.leave;
           return s;
         },
+        // §3.4 研究活动 → 座位分布（用于活动插件展示组内学生坐哪）
+        async getActivitySeatMap(activityId: string) {
+          const groups = await getResearchGroups(activityId);
+          const memberIds = [...new Set(groups.flatMap(g => g.member_ids))];
+          if (memberIds.length === 0) return {};
+          const placeholders = memberIds.map(() => '?').join(',');
+          const rows = rawDb.prepare(`
+            SELECT sa.student_id, sa.lab_id, sa.row_idx, sa.col_idx
+            FROM ${T_ASSIGN} sa
+            WHERE sa.student_id IN (${placeholders})
+          `).all(...memberIds) as any[];
+          const map: Record<string, { labId: string; rowIdx: number; colIdx: number }> = {};
+          for (const r of rows) {
+            map[r.student_id] = { labId: r.lab_id, rowIdx: r.row_idx, colIdx: r.col_idx };
+          }
+          return map;
+        },
       },
       );
+    }
+
+    // ── 13. 签到异常自动判定（§3.2） ──
+    // 定时扫描所有 open 的签到会话，按配置自动：
+    //  - 开启后超时未签到 → leave（请假）
+    //  - 已 late 且超时未签到 → absent（缺勤）
+    // 抽成 command 便于手动触发 / 单测 / AI 调用；interval 只做周期触发。
+    const autoMarkLeaveAfter = Number(getConfigValue('auto_mark_leave_after_minutes')) || 0;
+    const latePromoteAfter = Number(getConfigValue('late_auto_promote_after_minutes')) || 0;
+    const scanIntervalSec = Number(getConfigValue('auto_scan_interval_seconds')) || 60;
+    const autoEnabled = autoMarkLeaveAfter > 0 || latePromoteAfter > 0;
+
+    const runAutoScan = async () => {
+      const now = Date.now();
+      const openSessions = rawDb.prepare(
+        `SELECT * FROM ${T_SESSIONS} WHERE status = 'open'`
+      ).all() as any[];
+      for (const session of openSessions) {
+        const openedAt = session.opened_at || 0;
+        if (autoMarkLeaveAfter > 0) {
+          // 超时未签到 → leave
+          const missings = rawDb.prepare(
+            `SELECT sa.student_id FROM ${T_ASSIGN} sa
+             LEFT JOIN ${T_ATTEND} a ON a.lesson_id = sa.lesson_id AND a.student_id = sa.student_id
+             WHERE sa.lesson_id = ? AND a.id IS NULL`
+          ).all(session.lesson_id) as any[];
+          for (const row of missings) {
+            if ((now - openedAt) > autoMarkLeaveAfter * 60 * 1000) {
+              rawDb.prepare(`INSERT OR REPLACE INTO ${T_ATTEND}
+                (id, lesson_id, student_id, status, checked_in_at, note)
+                VALUES (?, ?, ?, 'leave', NULL, '自动标记：超时未签到')`)
+                .run(uid(), session.lesson_id, row.student_id);
+              ctx.log.info(`[auto] ${row.student_id} 在课节 ${session.lesson_id} 自动标记为请假`);
+            }
+          }
+        }
+        if (latePromoteAfter > 0) {
+          // 已迟到且开启时间超阈值 → absent
+          const lates = rawDb.prepare(
+            `SELECT * FROM ${T_ATTEND} WHERE lesson_id = ? AND status = 'late'`
+          ).all(session.lesson_id) as any[];
+          const lateThresholdMs = (Number(getConfigValue('late_threshold_minutes')) || 10) * 60 * 1000;
+          for (const late of lates) {
+            if ((now - openedAt) > (latePromoteAfter * 60 * 1000) + lateThresholdMs) {
+              rawDb.prepare(`UPDATE ${T_ATTEND} SET status = 'absent', note = '自动升级：迟到超时'
+                WHERE lesson_id = ? AND student_id = ?`)
+                .run(session.lesson_id, late.student_id);
+              ctx.log.info(`[auto] ${late.student_id} 迟到超时升级为缺勤`);
+            }
+          }
+        }
+      }
+    };
+
+    await commandBus.registerHandler('lab_seat.auto_mark_absent', {
+      async execute() {
+        await runAutoScan();
+        return { ok: true };
+      },
+    });
+
+    if (autoEnabled) {
+      runAutoScan();
+      autoScanTimer = setInterval(runAutoScan, Math.max(scanIntervalSec, 10) * 1000);
+      ctx.log.info(`[auto-scan] 签到异常自动判定已启用 (间隔 ${scanIntervalSec}s)`);
+    } else {
+      ctx.log.info('[auto-scan] 签到异常自动判定关闭（未配置阈值）');
     }
 
     ctx.log.info('Plugin activated');
   },
 
   async deactivate() {
+    // §3.2 清理自动扫描 timer
+    if (autoScanTimer) {
+      clearInterval(autoScanTimer);
+      autoScanTimer = null;
+    }
     // ctx.db.dropAllTables() 由 PluginHost 自动调用
   },
 };

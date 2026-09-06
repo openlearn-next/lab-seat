@@ -24,22 +24,83 @@ async function invoke<T = any>(type: string, payload?: any): Promise<T> {
 }
 
 // FrontendPluginContext.services 在不同 host 版本下差异较大：
-// 老版本可能没有 socketService；新版本可能有。统一封装，安全 fallback 到轮询。
-function subscribeToEvents(events: string[], handler: (event: any) => void): () => void {
+// 老版本可能没有 socketService；新版本可能有。统一封装。
+//
+// 特性：
+//  - 有 socketService → 事件驱动订阅；额外保留低频心跳轮询作为事件丢失兑底。
+//  - 无 socketService → 自适应轮询：页面可见时快，隐藏时暂停；连续无变化时
+//    间隔指数退避（5s→10s→20s→30s 封顶），数据变化后回到快速档。
+//  - in-flight 保护：handler 异步执行期间跳过下一次调度，避免竞态叠加。
+function subscribeToEvents(
+  events: string[],
+  handler: (event?: any) => void | Promise<void>,
+  opts?: { fastMs?: number; maxMs?: number },
+): () => void {
   const sock = ctx?.services?.socketService;
+  const fastMs = opts?.fastMs ?? 3000;
+  const maxMs = opts?.maxMs ?? 30000;
+  let disposed = false;
+  let timer: any = null;
+  let inFlight = false;
+
+  const clearTimer = () => { if (timer) { clearTimeout(timer); timer = null; } };
+
+  // 心跳 / 轮询执行体（带 in-flight 保护）
+  const tick = async () => {
+    if (disposed || inFlight) return;
+    inFlight = true;
+    try { await handler(); } catch { /* 静默：数据源瞬时错误由下次轮询重试 */ } finally { inFlight = false; }
+  };
+
+  let currentMs = fastMs;
+  const scheduleNext = (resetToFast: boolean) => {
+    if (disposed) return;
+    if (resetToFast) currentMs = fastMs;
+    clearTimer();
+    timer = setTimeout(() => {
+      tick().then(() => {
+        // 退避：每次空闲后拉长，收到真实变化事件则重置（见下方 onEvent）
+        currentMs = Math.min(currentMs * 2, maxMs);
+        scheduleNext(false);
+      });
+    }, currentMs);
+  };
+
+  // 事件驱动（socket 存在时）
+  let stopSocket: (() => void) | null = null;
   if (sock && typeof sock.on === 'function' && typeof sock.off === 'function') {
+    const onEvent = (event: any) => {
+      currentMs = fastMs; // 收到真实事件 → 回到快速档
+      tick();
+    };
     for (const ev of events) {
-      try { sock.on(ev, handler); } catch { /* 静默 */ }
+      try { sock.on(ev, onEvent); } catch { /* 静默 */ }
     }
-    return () => {
+    stopSocket = () => {
       for (const ev of events) {
-        try { sock.off(ev, handler); } catch { /* 静默 */ }
+        try { sock.off(ev, onEvent); } catch { /* 静默 */ }
       }
     };
   }
-  // Fallback：每 5s 轮询
-  const id = setInterval(handler, 5000);
-  return () => clearInterval(id);
+
+  // 可见性感知：标签页隐藏时暂停后台轮询省电，恢复后立即补一次
+  const onVisibility = () => {
+    if (document.hidden) { clearTimer(); return; }
+    currentMs = fastMs;
+    scheduleNext(true);
+  };
+  document.addEventListener('visibilitychange', onVisibility);
+
+  // 启动（初始立即执行一次）
+  tick();
+  scheduleNext(true);
+
+  return () => {
+    disposed = true;
+    clearTimer();
+    document.removeEventListener('visibilitychange', onVisibility);
+    stopSocket?.();
+  };
 }
 
 // 浏览器原生 CSV 下载，不依赖 host 的 uiService。
@@ -441,6 +502,13 @@ function SeatAssignment({ lessonId: externalLessonId }: { lessonId?: string } = 
   const [dragMsg, setDragMsg] = useState('');
   const [attendance, setAttendance] = useState<any>(null);
 
+  // §2.5 触屏友好：HTML5 Drag & Drop 在触屏上不工作。
+  // isTouch = true 时降级为「点学生 → 点目标座位」两步 picker。
+  const [isTouch] = useState(() =>
+    typeof window !== 'undefined'
+      && (('ontouchstart' in window) || (navigator.maxTouchPoints > 0)));
+  const [pendingMove, setPendingMove] = useState<any>(null); // 待落座的学生 chip（触屏 picker）
+
   // 父组件传入的 lessonId 是受控值；没有时退化为手填输入框
   const [internalLessonId, setInternalLessonId] = useState('');
   const lessonId = externalLessonId || internalLessonId;
@@ -538,8 +606,48 @@ function SeatAssignment({ lessonId: externalLessonId }: { lessonId?: string } = 
   const handleDrop = async (e: any, row: number, col: number) => {
     e.preventDefault();
     const studentId = e.dataTransfer.getData('text/plain');
+    await moveStudent(studentId, row, col);
+  };
+
+  // 统一移动逻辑：桌面拖拽 + 触屏 picker 都走这里。row/col 为 -1 时表示移除座位
+  const moveStudent = async (studentId: string, row: number, col: number) => {
+    if (!studentId || studentId === '') return;
+    if (row < 0 || col < 0) {
+      await invoke('lab_seat.unassign_student', { lessonId, studentId });
+      await loadAssignments();
+      setPendingMove(null);
+      return;
+    }
+    // 目标座位已被其他学生占时提示，不覆盖
+    const occupied = occupyMap.get(`${row},${col}`);
+    if (occupied && occupied !== studentId) {
+      setDragMsg(`座位已被 ${occupied} 占用，先移除该学生`);
+      setPendingMove(null);
+      return;
+    }
     await invoke('lab_seat.move_student', { lessonId, studentId, rowIdx: row, colIdx: col });
-    loadAssignments();
+    await loadAssignments();
+    setPendingMove(null);
+  };
+
+  // 触屏 picker：点击学生 chip 选中待落座对象
+  const handleChipTap = (a: any) => {
+    if (!isTouch) return; // 桌面仍用拖拽
+    if (pendingMove?.student_id === a.student_id) {
+      setPendingMove(null);
+      setDragMsg('');
+    } else {
+      setPendingMove(a);
+      setDragMsg(`已选中 ${a.student_name}，点击下方目标座位落座`);
+    }
+  };
+
+  // 触屏 picker：点击座位格落座（仅 when pendingMove active）
+  const handleCellTap = (cell: any) => {
+    if (!isTouch) return;
+    if (pendingMove) {
+      moveStudent(pendingMove.student_id, cell.row, cell.col);
+    }
   };
 
   const occupyMap = new Map<string, string>();
@@ -626,22 +734,28 @@ function SeatAssignment({ lessonId: externalLessonId }: { lessonId?: string } = 
 
       {viewLabId && layout && (
         <div style={{ marginTop: 8 }}>
-          <p style={{ fontSize: 13, color: '#6b7280', marginBottom: 8 }}>座位网格（拖拽学生到目标座位）· 当前机房：{linkedLabs.find((l: any) => l.id === viewLabId)?.display_name || viewLabId}</p>
+          <p style={{ fontSize: 13, color: '#6b7280', marginBottom: 8 }}>
+            座位网格{isTouch ? '（先点学生，再点目标座位落座）' : '（拖拽学生到目标座位）'} · 当前机房：{linkedLabs.find((l: any) => l.id === viewLabId)?.display_name || viewLabId}
+          </p>
           <div style={{ display: 'grid', gridTemplateColumns: `repeat(${layout.cols}, 64px)`, gap: 4, marginBottom: 8 }}>
             {layout.cells.map((cell: any) => {
               const key = `${cell.row},${cell.col}`;
               const student = occupyMap.get(key);
               const attStatus = attendance?.records?.find((r: any) => r.row_idx === cell.row && r.col_idx === cell.col)?.status;
               const bg = student ? (attStatus ? STATUS_COLORS[attStatus] : '#dbeafe') : '#f3f4f6';
+              // 触屏 picker 高亮可落座目标
+              const tappable = isTouch && pendingMove;
               return (
                 <div key={key}
                   data-row={cell.row} data-col={cell.col}
                   onDragOver={(e: any) => e.preventDefault()}
                   onDrop={(e: any) => handleDrop(e, cell.row, cell.col)}
+                  onClick={() => handleCellTap(cell)}
                   style={{
-                    width: 60, height: 48, border: '1px solid #d1d5db', borderRadius: 4, background: bg,
+                    width: 60, height: 48, border: tappable && !student ? '2px solid #2563eb' : '1px solid #d1d5db', borderRadius: 4, background: bg,
                     display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
-                    fontSize: 11, cursor: 'pointer', overflow: 'hidden',
+                    fontSize: 11, cursor: tappable ? 'crosshair' : 'pointer', overflow: 'hidden',
+                    transition: 'border-color .1s',
                   }}>
                   <span style={{ fontWeight: 600 }}>{cell.label}</span>
                   {student && (
@@ -692,15 +806,34 @@ function SeatAssignment({ lessonId: externalLessonId }: { lessonId?: string } = 
             </button>
           </div>
           <p style={{ fontSize: 12, color: '#6b7280' }}>已分配 {assignments.length} 名学生</p>
-          <div style={{ marginTop: 8, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-            {assignments.map((a: any) => (
-              <div key={a.student_id} draggable
-                onDragStart={(e: any) => handleDragStart(e, a.student_id)}
-                style={{ padding: '4px 8px', background: '#f3f4f6', borderRadius: 4, fontSize: 12, cursor: 'grab', border: '1px solid #e5e7eb' }}
-              >
-                {a.student_name}
-              </div>
-            ))}
+          <div style={{ marginTop: 8, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+            {assignments.map((a: any) => {
+              const isPending = pendingMove?.student_id === a.student_id;
+              return (
+                <span key={a.student_id}
+                  draggable
+                  onDragStart={(e: any) => handleDragStart(e, a.student_id)}
+                  onClick={() => handleChipTap(a)}
+                  title={isTouch ? '点击选中，再点座位落座；再次点击取消' : '拖拽到座位；点击可移除座位'}
+                  style={{
+                    padding: '4px 8px', background: isPending ? '#2563eb' : '#f3f4f6',
+                    borderRadius: 4, fontSize: 12,
+                    cursor: isTouch ? 'pointer' : 'grab',
+                    border: isPending ? '1px solid #2563eb' : '1px solid #e5e7eb',
+                    color: isPending ? '#fff' : 'inherit',
+                  }}
+                >
+                  {a.student_name}
+                  {!isTouch && (
+                    <span
+                      onClick={(e: any) => { e.stopPropagation(); moveStudent(a.student_id, -1, -1); }}
+                      title="移除座位（回到未分配区）"
+                      style={{ marginLeft: 6, cursor: 'pointer', opacity: 0.5, fontSize: 11 }}
+                    >✕</span>
+                  )}
+                </span>
+              );
+            })}
           </div>
         </div>
       )}
@@ -867,10 +1000,24 @@ function AttendanceHistory({ lessonId: externalLessonId }: { lessonId?: string }
   const [internalLessonId, setInternalLessonId] = useState('');
   const lessonId = externalLessonId || internalLessonId;
   const [data, setData] = useState<any>(null);
+  const [trend, setTrend] = useState<any[]>([]);
+  const [trendOpen, setTrendOpen] = useState(false);
+  const [trendLoading, setTrendLoading] = useState(false);
 
   useEffect(() => {
     if (lessonId) invoke<any>('lab_seat.get_attendance', { lessonId }).then(setData);
   }, [lessonId]);
+
+  const loadTrend = async () => {
+    setTrendOpen(true);
+    setTrendLoading(true);
+    try {
+      const r = await invoke<any>('lab_seat.attendance_trend', { sinceDays: 30 });
+      setTrend(r?.series || []);
+    } finally {
+      setTrendLoading(false);
+    }
+  };
 
   const records = data?.records || [];
 
@@ -895,7 +1042,41 @@ function AttendanceHistory({ lessonId: externalLessonId }: { lessonId?: string }
         >
           导出 CSV
         </button>
+        <button
+          onClick={loadTrend}
+          style={{ padding: '6px 16px', border: '1px solid #d1d5db', borderRadius: 4, background: trendOpen ? '#eef2ff' : '#fff', cursor: 'pointer' }}
+        >
+          近 30 天到课趋势
+        </button>
       </div>
+
+      {trendOpen && (
+        <div style={{ marginBottom: 20, padding: 12, background: '#f9fafb', borderRadius: 8 }}>
+          <p style={{ fontSize: 13, fontWeight: 600, marginBottom: 10 }}>📈 到课率趋势（按课节）</p>
+          {trendLoading ? <p style={{ color: '#9ca3af', fontSize: 12 }}>加载中…</p> : trend.length === 0 ? (
+            <p style={{ color: '#9ca3af', fontSize: 12 }}>近 30 天暂无签到课节</p>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {trend.slice(0, 15).map((t: any, i: number) => (
+                <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
+                  <span style={{ width: 52, color: '#6b7280', fontSize: 11, whiteSpace: 'nowrap' }}>
+                    {new Date(t.openedAt).toLocaleDateString(undefined, { month: 'numeric', day: 'numeric' })}
+                  </span>
+                  <div style={{ flex: 1, background: '#e5e7eb', borderRadius: 3, height: 16, overflow: 'hidden', position: 'relative' }}>
+                    <div style={{
+                      width: `${Math.max(t.attendanceRate, 2)}%`, height: '100%',
+                      background: t.attendanceRate >= 80 ? '#22c55e' : t.attendanceRate >= 50 ? '#eab308' : '#ef4444',
+                    }} />
+                  </div>
+                  <span style={{ width: 90, color: '#374151', fontSize: 11 }} title={`到 ${t.present}/${t.total}，迟到 ${t.late}，请假 ${t.leave}`}>
+                    {t.attendanceRate}% · {t.present}/{t.total}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {records.length > 0 ? (
         <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>

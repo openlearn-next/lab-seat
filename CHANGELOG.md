@@ -4,6 +4,23 @@ All notable changes to the **机房座位管理（Lab Seat Management）Plugin**
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.5.0] - 2026-09-06
+
+### Added
+- **签到异常流程自动化（§3.2）**：新增配置 `auto_mark_leave_after_minutes`（签到开启 N 分钟未签到自动标记请假）、`late_auto_promote_after_minutes`（迟到 N 分钟未签到自动升级缺勤）、`auto_scan_interval_seconds`（扫描间隔，默认 60s）。后台 `setInterval` 周期扫描 open 会话；判定逻辑抽成可 AI/手动触发的 `lab_seat.auto_mark_absent` command（interval 仅做周期调度）。deactivate 时清理 timer。
+- **历史到课率趋势（§3.3）**：新 handler `lab_seat.attendance_trend`，按课节聚合（opened_at 锚点 / total = 该课节被分配人数 / checked/late/leave/absent / 到课率%），返回时间倒序序列。前端「历史记录」tab 新增「近 30 天到课趋势」按钮 → 纯 CSS 条形图（不引入 recharts，避免 bundle 膨胀）。
+- **活动插件联动重构（§3.4）**：分组读取抽成 `getResearchGroups(activityId)` —— 先探测 `IActivityRegistryToken` 活动生态，不存在则回退直查 `plugin_research_groups` 表，**表缺失不崩溃**（返回空分组，成员落到队列末尾仍全分配）。`ILabSeatService` 新增 `getActivitySeatMap(activityId)` 返回 学生→{labId,rowIdx,colIdx} 供活动插件展示组内座位。
+- **移除单个学生座位（§2.5 配套）**：新 command `lab_seat.unassign_student`（删除单条分配，返回 removed 布尔）。
+- **3 项新配置** 在 manifest `configuration` 中声明，插件中心「设置」页自动生成表单。
+
+### Changed
+- **事件订阅升级（§2.3）**：`subscribeToEvents` 现在带可见性感知（标签页隐藏暂停轮询省电）、in-flight 保护（handler 执行中跳过下次调度）、空闲指数退避（3s→30s 封顶）、收到真实 socket 事件立即回到快速档；保留 socketService 订阅 + 低频心跳兜底。
+- **触屏拖拽降级（§2.5）**：SeatAssignment 检测 `ontouchstart` / `maxTouchPoints` → 触屏设备自动启用「点学生 chip → 点目标座位」两步落座，不再依赖无效的 HTML5 drag；桌面仍为拖拽，且座位格/学生 chip 增加占用提示（目标被占时明确报错不覆盖）。
+- **配置读取扩展**：worker runtime 无 `ctx.config` 时已能回退 manifest default；现同时支持 mock host 注入 config 覆盖（便于测试）。
+
+### Security
+- 自动判定仅把「未签到」升级为请假、把「迟到」升级为缺勤，**不删除**已有签到记录（幂等 INSERT OR REPLACE / UPDATE，绝不触碰已 checked_in 记录）。
+
 ## [0.4.0] - 2026-09-06
 
 ### Added

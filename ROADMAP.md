@@ -1,7 +1,7 @@
 # Roadmap — openlearn-plugin-lab-seat
 
 > **Plugin**: `openlearn-plugin-lab-seat` (机房座位管理)
-> **Current version**: 0.3.0
+> **Current version**: 0.5.0
 > **Last audit**: 2026-09-06
 > **Target SDK**: `@openlearn/plugin-sdk@^3.5.2`
 
@@ -96,7 +96,7 @@
 - 前端 `TeacherLabPanel` 顶部加 lesson picker（select 控件），自动填充所有 tab 的 lessonId 输入框
 - 优先 lesson：`status === 'live'` 的 lesson，其次按 `started_at` 最近 30 天内的 lesson
 
-### 2.3 实时签到通知（WebSocket / SSE）
+### 2.3 实时签到通知 ✅ 0.5.0 已交付（事件退避轮询 + 可见性感知）
 
 **现状**：dashboard widget 依赖 `socketService` 事件推送降级到 5s 轮询；事件密集时延迟感明显。
 
@@ -115,7 +115,7 @@
 - 持久化到 `computer_labs.layout_json`
 - **前置**：先实现 §1.3 的迁移到 JSX，避免在 createElement 上叠加新功能
 
-### 2.5 拖拽 UX 升级
+### 2.5 拖拽 UX（触屏 fallback） ✅ 0.5.0 已交付
 
 **现状**：拖拽学生到目标座位（`SeatAssignment` 组件 line 159 附近）使用 HTML5 Drag & Drop API，在触屏设备上完全不工作。
 
@@ -136,7 +136,7 @@
 - 拆分 `seat_assignments` 加 `lesson_room_id` 字段
 - 前端 `SeatAssignment` UI 支持多机房切换
 
-### 3.2 签到异常流程自动化
+### 3.2 签到异常流程自动化 ✅ 0.5.0 已交付（auto_mark_absent）
 
 **现状**：当前只支持 `checked_in` / `late` / `leave` / `absent` 四种状态，无自动化规则。
 
@@ -145,7 +145,7 @@
 - 配置项新增 `late_auto_promote_after_minutes: number`：迟到超过该时长自动判 `absent`
 - 在 EventBus 订阅里加 cron-like 任务（用 `setInterval` 扫描）
 
-### 3.3 历史数据聚合与可视化
+### 3.3 历史数据聚合与可视化 ✅ 0.5.0 已交付（attendance_trend）
 
 **现状**：考勤看板只展示当前 lesson。历史记录仅表格 + CSV 导出。
 
@@ -154,7 +154,7 @@
 - 前端 `AttendanceDashboard` 加趋势图（需要确认 recharts 是否已在白名单——文档说是的）
 - 配合 §2.1 的 JSX 重构，使用 recharts 的 `<LineChart>` 直接渲染
 
-### 3.4 与研究活动插件联动
+### 3.4 与研究活动插件联动 ✅ 0.5.0 已交付（getResearchGroups + getActivitySeatMap）
 
 **现状**：已通过 `plugin_research_groups` 表读取活动分组（`assign_seats` line 333 附近），但耦合在 SQL 硬编码中。
 
@@ -211,9 +211,12 @@
 
 ### 5.3 测试覆盖
 
-当前 0% 测试覆盖率。建议：
-- 单元测试：`escapeCsvField` / `getLabLayout` / `assignSequential` 等纯函数
-- 集成测试：在 mock DB + CommandBus 上跑完整 assign → check_in → export 链路
+当前状态（v0.5.0）：
+- ✅ CSV 转义单元测试 14 例（0.3.0）——普通/空/null/数字/逗号/引号/换行/端到端
+- ✅ Worker harness 集成测试 18 例（0.4.0–0.5.0）——mock better-sqlite3 + CommandBus，覆盖 schema 迁移、20+ 命令注册、create→assign→check_in 链路、多机房、update_layout、趋势、自动判定、活动分组、特殊字符导出
+- ✅ `pnpm test` 一键运行（先构建 test-bundle 再跑两套）
+
+仍待补：
 - 端到端测试：用 Playwright 打开 host 渲染的 `teacher.tab` 面板并交互
 
 ---
