@@ -100,9 +100,10 @@ AI：`smart_assign_seats`
 
 ---
 
-## 已知问题
+## 已知问题 / 发布注记
 
-- **服务端 bundle 偏大（~7.4 MB）**：SDK 3.5.2 `cli.mjs` 把 `@openlearn/plugin-sdk` dist inline 时连带其顶层第三方 import（express/jszip/pino/…）。属 SDK 架构债，修复提案见 [`docs/sdk-pr/proposal.md`](docs/sdk-pr/proposal.md)。本插件只依赖 SDK 的 Token/type，不直接使用这些重型实现。
+- **SDK bundle 瘦身**：本插件 build 产物从 ~7.4 MB 降至 **~0.2 MB**（zip ~0.43 MB）。修复已 apply 宿主 SDK（commit `68ee958`，`packages/plugin-sdk` 停止值导出 host-runtime 实现类，`dist` 34KB→7.7KB），详见 [`docs/sdk-pr/proposal.md`](docs/sdk-pr/proposal.md)。
+- **本地验证说明**：当前仓库构建依赖的 `@openlearn/plugin-sdk` dist 为已同步的瘦身版；待 SDK 正式发版（含该修复）后 `npm install` 即天然获得同样效果。若安装的是旧版 SDK，bundle 会回到 ~7.4 MB（功能不受影响）。
 
 ---
 

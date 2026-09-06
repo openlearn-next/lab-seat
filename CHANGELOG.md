@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 - 前端错误文案不再带 `[lab_seat:CODE]` 技术前缀（三处 catch 改为 humanizeErr）。
+- README「已知问题」更新为瘦身后的准确状态（bundle ~0.2 MB，SDK 修复落地记录见 docs/sdk-pr）。
 
 ## [0.6.0] - 2026-09-06
 
