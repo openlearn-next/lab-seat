@@ -1340,29 +1340,36 @@ export default {
     }
 
     // ── 13. 签到异常自动判定（§3.2） ──
-    // 定时扫描所有 open 的签到会话，按配置自动：
-    //  - 开启后超时未签到 → leave（请假）
-    //  - 已 late 且超时未签到 → absent（缺勤）
+    // 定时扫描所有 open 的签到会话，按配置自动（两者都只处理「无签到记录」的学生）：
+    //  - auto_mark_leave_after_minutes：开启超 N 分钟仍未签到 → 标 leave（请假）
+    //  - late_auto_promote_after_minutes：开启超 (迟到阈值 + N 分钟) 仍未签到 → 标 absent（缺勤）
+    //    注意：绝不触碰已签到者（含 late——他们到堂了，仅迟到）。
+    // 两个窗口若重叠，先满足者先生效（INSERT OR REPLACE 幂等）。
     // 抽成 command 便于手动触发 / 单测 / AI 调用；interval 只做周期触发。
     const autoMarkLeaveAfter = Number(getConfigValue('auto_mark_leave_after_minutes')) || 0;
     const latePromoteAfter = Number(getConfigValue('late_auto_promote_after_minutes')) || 0;
     const scanIntervalSec = Number(getConfigValue('auto_scan_interval_seconds')) || 60;
     const autoEnabled = autoMarkLeaveAfter > 0 || latePromoteAfter > 0;
 
+    // 无签到记录的学生（两种自动判定共同的候选集）
+    const findMissingStudents = (lessonId: string): Array<{ student_id: string }> =>
+      rawDb.prepare(
+        `SELECT sa.student_id FROM ${T_ASSIGN} sa
+         LEFT JOIN ${T_ATTEND} a ON a.lesson_id = sa.lesson_id AND a.student_id = sa.student_id
+         WHERE sa.lesson_id = ? AND a.id IS NULL`
+      ).all(lessonId) as any;
+
     const runAutoScan = async () => {
       const now = Date.now();
       const openSessions = rawDb.prepare(
         `SELECT * FROM ${T_SESSIONS} WHERE status = 'open'`
       ).all() as any[];
+      const lateThresholdMs = (Number(getConfigValue('late_threshold_minutes')) || 10) * 60 * 1000;
       for (const session of openSessions) {
         const openedAt = session.opened_at || 0;
         if (autoMarkLeaveAfter > 0) {
-          // 超时未签到 → leave
-          const missings = rawDb.prepare(
-            `SELECT sa.student_id FROM ${T_ASSIGN} sa
-             LEFT JOIN ${T_ATTEND} a ON a.lesson_id = sa.lesson_id AND a.student_id = sa.student_id
-             WHERE sa.lesson_id = ? AND a.id IS NULL`
-          ).all(session.lesson_id) as any[];
+          // 超时未签到 → leave（请假）
+          const missings = findMissingStudents(session.lesson_id);
           for (const row of missings) {
             if ((now - openedAt) > autoMarkLeaveAfter * 60 * 1000) {
               rawDb.prepare(`INSERT OR REPLACE INTO ${T_ATTEND}
@@ -1374,17 +1381,16 @@ export default {
           }
         }
         if (latePromoteAfter > 0) {
-          // 已迟到且开启时间超阈值 → absent
-          const lates = rawDb.prepare(
-            `SELECT * FROM ${T_ATTEND} WHERE lesson_id = ? AND status = 'late'`
-          ).all(session.lesson_id) as any[];
-          const lateThresholdMs = (Number(getConfigValue('late_threshold_minutes')) || 10) * 60 * 1000;
-          for (const late of lates) {
-            if ((now - openedAt) > (latePromoteAfter * 60 * 1000) + lateThresholdMs) {
-              rawDb.prepare(`UPDATE ${T_ATTEND} SET status = 'absent', note = '自动升级：迟到超时'
-                WHERE lesson_id = ? AND student_id = ?`)
-                .run(session.lesson_id, late.student_id);
-              ctx.log.info(`[auto] ${late.student_id} 迟到超时升级为缺勤`);
+          // 未签到且已超 (迟到阈值 + N 分钟) 仍无记录 → absent（明确缺勤）
+          const missings = findMissingStudents(session.lesson_id);
+          const absentAfterMs = lateThresholdMs + latePromoteAfter * 60 * 1000;
+          for (const row of missings) {
+            if ((now - openedAt) > absentAfterMs) {
+              rawDb.prepare(`INSERT OR REPLACE INTO ${T_ATTEND}
+                (id, lesson_id, student_id, status, checked_in_at, note)
+                VALUES (?, ?, ?, 'absent', NULL, '自动判定：超时未签到按缺勤')`)
+                .run(uid(), session.lesson_id, row.student_id);
+              ctx.log.info(`[auto] ${row.student_id} 在课节 ${session.lesson_id} 自动标记为缺勤`);
             }
           }
         }

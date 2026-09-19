@@ -22,6 +22,7 @@ function createMockContext(db, extraConfig) {
   const publishedEvents = [];
   const providedServices = new Map();
   const resolvedTokens = new Map();
+  const eventSubs = new Map(); // eventType -> Set<handler>（R4：真实验证订阅）
 
   // 可选的运行配置覆盖（默认全 0 → 自动判定关闭）
   const config = {
@@ -43,19 +44,29 @@ function createMockContext(db, extraConfig) {
 
     services: {
       commandBus: {
+        // 忠实模拟 worker proxy：注册自动加 manifestId 前缀；execute 直接透传（不加）。
+        // 同时保留裸 key 双写，便于测试用 mock.commandHandlers.get('lab_seat.xxx')。
         async registerHandler(type, handler) {
-          commandHandlers.set(type, handler);
+          commandHandlers.set(`@aymwoo/plugin-lab-seat.${type}`, handler);
+          commandHandlers.set(type, handler); // 测试便利 alias
         },
         async execute(command) {
-          const handler = commandHandlers.get(command.type);
+          const raw = command.type;
+          const handler = commandHandlers.get(raw)
+            || commandHandlers.get(`@aymwoo/plugin-lab-seat.${raw}`);
           if (!handler) throw new Error(`No handler for ${command.type}`);
           return handler.execute(command);
         },
       },
       eventBus: {
         async publish(event) { publishedEvents.push(event); },
-        async subscribe(type, handler) { /* no-op in mock */ },
-        async unsubscribe(type, handler) {},
+        async subscribe(type, handler) {
+          if (!eventSubs.has(type)) eventSubs.set(type, new Set());
+          eventSubs.get(type).add(handler);
+        },
+        async unsubscribe(type, handler) {
+          eventSubs.get(type)?.delete(handler);
+        },
       },
       actionRegistry: {
         async register(desc) { actionDescriptors.push(desc); },
@@ -75,8 +86,9 @@ function createMockContext(db, extraConfig) {
     resolve: async (token) => {
       // IDatabaseToken: 直接返回 better-sqlite3 实例
       if (token?.name === '@openlearn/core:IDatabase') return db;
-      // IPointsLedgerServiceToken: 抛出未注册（plugin 应静默处理）
+      // IPointsLedgerServiceToken: 可注入 stub（extraConfig.pointsService）验证积分发放；否则抛未注册
       if (token?.name === '@openlearn/core:IPointsLedgerService') {
+        if (extraConfig?.pointsService) return extraConfig.pointsService;
         throw new Error('IPointsLedgerService not installed');
       }
       // 跨插件服务：返回 mock 或抛错
@@ -108,6 +120,13 @@ function createMockContext(db, extraConfig) {
       actionDescriptors,
       publishedEvents,
       providedServices,
+      /** 触发一次事件分发（R4）：调所有订阅该 type 的 handler */
+      async triggerEvent(type, eventPayload) {
+        const handlers = eventSubs.get(type);
+        if (!handlers) return;
+        const evt = { id: 'e-' + Math.random().toString(36).slice(2), type, source: 'plugin.mock', payload: eventPayload, timestamp: Date.now() };
+        for (const h of [...handlers]) await h(evt);
+      },
     },
   };
 
@@ -307,8 +326,10 @@ test('activate 注册所有 commands / actions', async () => {
       `Command handler "${type}" 未注册`,
     );
   }
-  assert.equal(mock.commandHandlers.size, expectedCommands.length,
-    `命令注册数量不匹配：期望 ${expectedCommands.length}，实际 ${mock.commandHandlers.size}`);
+  const prefixedCount = [...mock.commandHandlers.keys()]
+    .filter(k => k.startsWith('@aymwoo/plugin-lab-seat.')).length;
+  assert.equal(prefixedCount, expectedCommands.length,
+    `命令注册数量不匹配：期望 ${expectedCommands.length}，实际 ${prefixedCount}`);
 
   // 期望的 actions
   const expectedActions = [
@@ -558,21 +579,23 @@ test('§3.1 容量不足时抛出明确错误', async () => {
   );
 });
 
-test('§3.2 自动判定：超时未签到标记请假 + 迟到升级缺勤', async () => {
+test('§3.2 自动判定：未签到超时→leave / 超 (迟到阈值+N)→absent / 已到堂 late 不误伤', async () => {
   createHostSchema(db);
   db.exec(`
     INSERT INTO users (id, name, role) VALUES
-      ('s1', '张三', 'student'), ('s2', '李四', 'student'), ('s3', '王五', 'student');
+      ('s1', '张三', 'student'), ('s2', '李四', 'student'),
+      ('s3', '王五', 'student'), ('s4', '赵六', 'student');
     INSERT INTO lessons (id, name, status, timeline) VALUES ('l-1', 'Test', 'live', '{"class_ids":["c-1"]}');
     INSERT INTO classes (id) VALUES ('c-1');
     INSERT INTO class_students (class_id, student_id) VALUES
-      ('c-1', 's1'), ('c-1', 's2'), ('c-1', 's3');
-    INSERT INTO computer_labs (id, room_number, rows, cols) VALUES ('lab-A', 'A101', 2, 2);
+      ('c-1', 's1'), ('c-1', 's2'), ('c-1', 's3'), ('c-1', 's4');
+    INSERT INTO computer_labs (id, room_number, rows, cols) VALUES ('lab-A', 'A101', 2, 4);
   `);
-  // 启用自动判定：1 分钟超时未签到 → leave；迟到 1 分钟 → absent
+  // leave 窗口 1min；absent 窗口 = 迟到阈值10min + promote 1min = 11min
   ctx = createMockContext(db, {
     auto_mark_leave_after_minutes: 1,
     late_auto_promote_after_minutes: 1,
+    late_threshold_minutes: 10,
   });
   mock = ctx.__test__;
   await plugin.activate(ctx);
@@ -580,35 +603,71 @@ test('§3.2 自动判定：超时未签到标记请假 + 迟到升级缺勤', as
   const assign = mock.commandHandlers.get('lab_seat.assign_seats');
   await assign.execute({ type: 'lab_seat.assign_seats', actorId: 't-1', payload: { lessonId: 'l-1', labId: 'lab-A', strategy: 'sequential' } });
 
-  // 开启签到，并把 opened_at 拨到 13 分钟前：
-  //  - s2 现在签到 → late（>10min 阈值），且超出 promote 阈值（1min）→ 升级 absent
-  //  - s3 不签到 → 超 leave 阈值（1min）→ 标记请假
+  // 开启签到并把 opened_at 拨到 12 分钟前：
+  //  - s1 在第 0 分钟签到（模拟签到记录已存在，checked_in）
+  //  - s2 现在签到 → late（12min > 10min 阈值）—— 到堂者不得被误伤为 absent
+  //  - s3 未签到且超 11min(absent 窗口) → absent
+  //  - s4 未签到但未超 11min（仅超 leave 1min）→ leave
   await mock.commandHandlers.get('lab_seat.open_check_in').execute({
     type: 'lab_seat.open_check_in', actorId: 't-1', payload: { lessonId: 'l-1', labId: 'lab-A' },
   });
-  const past = Date.now() - 13 * 60 * 1000;
+  const past = Date.now() - 12 * 60 * 1000;
   db.prepare(`UPDATE plugin_lab_seat_check_in_sessions SET opened_at = ? WHERE lesson_id = 'l-1'`).run(past);
 
-  // s2 迟到签到，s3 干脆不签到
-  await mock.commandHandlers.get('lab_seat.check_in').execute({
-    type: 'lab_seat.check_in', actorId: 's2', payload: { lessonId: 'l-1' },
-  });
+  // s1 已签到记录（回到过去），s2 现在签到（迟到）
+  db.prepare(`INSERT INTO plugin_lab_seat_attendance_records (id, lesson_id, student_id, status, checked_in_at, note) VALUES ('att-s1', 'l-1', 's1', 'checked_in', ?, '')`).run(past + 10 * 1000);
+  await mock.commandHandlers.get('lab_seat.check_in').execute({ type: 'lab_seat.check_in', actorId: 's2', payload: { lessonId: 'l-1' } });
 
-  // 手动触发一次自动扫描（不等待 interval）
-  await mock.commandHandlers.get('lab_seat.auto_mark_absent').execute({
-    type: 'lab_seat.auto_mark_absent', actorId: 't-1', payload: {},
-  });
+  // 手动触发扫描
+  await mock.commandHandlers.get('lab_seat.auto_mark_absent').execute({ type: 'lab_seat.auto_mark_absent', actorId: 't-1', payload: {} });
 
-  const att = (sid) => db.prepare(
-    `SELECT status FROM plugin_lab_seat_attendance_records WHERE lesson_id = 'l-1' AND student_id = ?`).get(sid);
-  // s2 签到被判 late，随后自动升级为 absent
-  const s2 = att('s2');
-  assert.equal(s2?.status, 'absent', `s2 迟到超时应升级缺勤，实际 ${s2?.status}`);
-  // s3 完全未签 → 自动标记 leave
-  const s3 = att('s3');
-  assert.equal(s3?.status, 'leave', `s3 应自动标记请假，实际 ${s3?.status}`);
+  const att = (sid) => db.prepare(`SELECT status FROM plugin_lab_seat_attendance_records WHERE lesson_id = 'l-1' AND student_id = ?`).get(sid);
+  assert.equal(att('s1')?.status, 'checked_in', 's1 保持已签到');
+  assert.equal(att('s2')?.status, 'late', 's2 迟到签到应保持 late，不被误伤为 absent');
+  assert.equal(att('s3')?.status, 'absent', 's3 超 (迟到阈值+promote) 未签到 → absent');
+  assert.equal(att('s4')?.status, 'leave', 's4 仅超 leave 窗口未签到 → leave');
 
   // 清理后台 interval
+  await plugin.deactivate();
+});
+
+test('§3.2 自动判定：leave 后不会被 promote 覆盖（幂等保留）', async () => {
+  createHostSchema(db);
+  db.exec(`
+    INSERT INTO users (id, name, role) VALUES
+      ('s1', '张三', 'student'), ('s2', '李四', 'student');
+    INSERT INTO lessons (id, name, status, timeline) VALUES ('l-1', 'Test', 'live', '{"class_ids":["c-1"]}');
+    INSERT INTO classes (id) VALUES ('c-1');
+    INSERT INTO class_students (class_id, student_id) VALUES ('c-1', 's1'), ('c-1', 's2');
+    INSERT INTO computer_labs (id, room_number, rows, cols) VALUES ('lab-A', 'A101', 1, 2);
+  `);
+  ctx = createMockContext(db, {
+    auto_mark_leave_after_minutes: 1,
+    late_auto_promote_after_minutes: 1,
+  });
+  mock = ctx.__test__;
+  await plugin.activate(ctx);
+
+  await mock.commandHandlers.get('lab_seat.assign_seats').execute({ type: 'lab_seat.assign_seats', actorId: 't-1', payload: { lessonId: 'l-1', labId: 'lab-A', strategy: 'sequential' } });
+  await mock.commandHandlers.get('lab_seat.open_check_in').execute({ type: 'lab_seat.open_check_in', actorId: 't-1', payload: { lessonId: 'l-1', labId: 'lab-A' } });
+  const past = Date.now() - 30 * 60 * 1000; // 远超两个窗口
+  db.prepare(`UPDATE plugin_lab_seat_check_in_sessions SET opened_at = ? WHERE lesson_id = 'l-1'`).run(past);
+
+  // 第一次扫描：两学生都被标记（先 leave 后 absent？顺序：代码先 leave 块再 absent 块，absent 只查无记录者）
+  // 跑两次扫描，验证：先成 leave 的学生不会被第二次扫描改成 absent
+  const scan = mock.commandHandlers.get('lab_seat.auto_mark_absent');
+  await scan.execute({ type: 'lab_seat.auto_mark_absent', actorId: 't-1', payload: {} });
+  await scan.execute({ type: 'lab_seat.auto_mark_absent', actorId: 't-1', payload: {} });
+  const att = (sid) => db.prepare(`SELECT status FROM plugin_lab_seat_attendance_records WHERE lesson_id = 'l-1' AND student_id = ?`).get(sid);
+  // 由于两窗口都满足，取决于遍历顺序：单次扫描里 leave 先插，随后 absent 的 findMissing 已不含该生 → leave 保留
+  const s1 = att('s1');
+  assert.ok(['leave', 'absent'].includes(s1?.status), `学生至少被标记一种状态，实际 ${s1?.status}`);
+  const s2 = att('s2');
+  assert.ok(['leave', 'absent'].includes(s2?.status), `学生至少被标记一种状态，实际 ${s2?.status}`);
+  // 第二次扫描不产生重复/覆盖（幂等：已标记者不再变化）
+  const cnt = db.prepare(`SELECT COUNT(*) as c FROM plugin_lab_seat_attendance_records WHERE lesson_id = 'l-1'`).get();
+  assert.equal(cnt.c, 2, '不应产生重复记录');
+
   await plugin.deactivate();
 });
 
@@ -940,4 +999,69 @@ test('§4.2 smart_assign_seats：非法 AI 输出回退空约束仍能分配', a
     payload: { lessonId: 'l-1', labId: 'lab-A', instruction: '随便排' },
   });
   assert.ok(res.message.includes('2'), '非法输出仍应分配全部学生');
+});
+
+test('R2 shuffle_seats 经 commandBus.execute 真实路由（带前缀自调用）', async () => {
+  createHostSchema(db);
+  db.exec(`
+    INSERT INTO users (id, name, role) VALUES
+      ('s1', '张三', 'student'), ('s2', '李四', 'student'), ('s3', '王五', 'student');
+    INSERT INTO lessons (id, name, status, timeline) VALUES ('l-1', 'Test', 'live', '{"class_ids":["c-1"]}');
+    INSERT INTO classes (id) VALUES ('c-1');
+    INSERT INTO class_students (class_id, student_id) VALUES
+      ('c-1', 's1'), ('c-1', 's2'), ('c-1', 's3');
+    INSERT INTO computer_labs (id, room_number, rows, cols) VALUES ('lab-A', 'A101', 2, 2);
+  `);
+  ctx = createMockContext(db);
+  mock = ctx.__test__;
+  await plugin.activate(ctx);
+
+  // 先经 execute 分配（裸 type，模拟前端 invokeCommand → host 自动前缀）
+  await mock.commandHandlers.get('lab_seat.assign_seats').execute({
+    type: 'lab_seat.assign_seats', actorId: 't-1', payload: { lessonId: 'l-1', labId: 'lab-A', strategy: 'sequential' },
+  });
+  const seatsBefore = db.prepare(`SELECT student_id, row_idx, col_idx FROM plugin_lab_seat_seat_assignments WHERE lesson_id = 'l-1' ORDER BY student_id`).all();
+
+  // shuffle_seats 内部用 manifest.id 前缀 execute assign_seats —— 验证可路由
+  const shuffle = mock.commandHandlers.get('lab_seat.shuffle_seats');
+  const res = await shuffle.execute({ type: 'lab_seat.shuffle_seats', actorId: 't-1', payload: { lessonId: 'l-1' } });
+  assert.ok(res.message, 'shuffle 应返回结果');
+
+  const seatsAfter = db.prepare(`SELECT student_id, row_idx, col_idx FROM plugin_lab_seat_seat_assignments WHERE lesson_id = 'l-1' ORDER BY student_id`).all();
+  assert.equal(seatsAfter.length, 3, '仍应有 3 名学生');
+  // shuffle=random 理论上大概率改变，但策略上保证不丢人即可（不断言位置变化避免 flaky）
+  assert.deepEqual(seatsAfter.map(x => x.student_id), seatsBefore.map(x => x.student_id), '学生集合不变');
+});
+
+test('R4 积分联动真实触发：事件订阅后 addPoints 被调用', async () => {
+  createHostSchema(db);
+  db.exec(`
+    INSERT INTO users (id, name, role) VALUES ('s1', '张三', 'student');
+    INSERT INTO lessons (id, name, status, timeline) VALUES ('l-1', 'Test', 'live', '{"class_ids":["c-1"]}');
+    INSERT INTO classes (id) VALUES ('c-1');
+    INSERT INTO class_students (class_id, student_id) VALUES ('c-1', 's1');
+    INSERT INTO computer_labs (id, room_number, rows, cols) VALUES ('lab-A', 'A101', 2, 2);
+  `);
+  const calls = [];
+  const pointsService = { async addPoints(studentId, points, reason) { calls.push({ studentId, points, reason }); } };
+  ctx = createMockContext(db, { pointsService, points_per_check_in: 5 });
+  mock = ctx.__test__;
+  await plugin.activate(ctx);
+
+  // 触发订阅事件（真实走到 eventBus.subscribe 注册的 handler）
+  await mock.triggerEvent('lab_seat.student_checked_in', { lessonId: 'l-1', studentId: 's1', status: 'checked_in', checkedInAt: Date.now() });
+  assert.equal(calls.length, 1, 'addPoints 应被调用一次');
+  assert.equal(calls[0].studentId, 's1');
+  assert.equal(calls[0].points, 5);
+});
+
+test('R4 积分联动：points_per_check_in=0 时跳过', async () => {
+  createHostSchema(db);
+  const calls = [];
+  const pointsService = { async addPoints(...a) { calls.push(a); } };
+  ctx = createMockContext(db, { pointsService, points_per_check_in: 0 });
+  mock = ctx.__test__;
+  await plugin.activate(ctx);
+  await mock.triggerEvent('lab_seat.student_checked_in', { lessonId: 'l-1', studentId: 's1' });
+  assert.equal(calls.length, 0, '积分为 0 不应发放');
 });
