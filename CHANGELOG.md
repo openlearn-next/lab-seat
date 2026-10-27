@@ -4,6 +4,11 @@ All notable changes to the **机房座位管理（Lab Seat Management）Plugin**
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.6.3] - 2026-10-27
+
+### Fixed
+- **manifest 补声明 `student-data:write` 能力**：宿主平台对 `IPointsLedgerService.addPoints` 施加 `student-data:write` 能力门禁（缺省抛 `PluginCapabilityDeniedError`）。本插件「签到发积分」（`points_per_check_in` 配置）依赖 `addPoints`，但 capabilitiesProposed 只有 `lab_seat:*` / `student:read` 等，在新宿主上积分发放会被拒绝（调用处有 try/catch，表现为签到成功但积分静默丢失）。补声明后需管理员在审批 UI 确认授予。
+
 ## [0.6.2] - 2026-09-06
 
 ### Fixed（审计 C1-C4 + R1/R6 修复）

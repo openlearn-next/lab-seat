@@ -96,7 +96,7 @@ export default {
   manifest: {
     id: '@aymwoo/plugin-lab-seat',
     name: '机房座位管理',
-    version: '0.6.2',
+    version: '0.6.3',
     description: '统一机房座位管理 - 教师编排布局分配座位，学生查看座位并签到',
     author: 'aymwoo',
     main: 'index.js',
@@ -121,6 +121,7 @@ export default {
       'lesson:read',
       'class:read',
       'student:read',
+      'student-data:write',
     ],
     updateSource: {
       type: 'github-release',
